@@ -1,0 +1,1 @@
+Trigger APK rebuild after fixing flutter_bluetooth_serial Android namespace.
