@@ -18,7 +18,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -55,7 +55,7 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
-      - name: Patch legacy Bluetooth Serial plugin for modern Android Gradle Plugin
+      - name: Patch legacy Bluetooth Serial plugin for modern Android
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -70,7 +70,13 @@ jobs:
           s = p.read_text()
           if 'namespace' not in s:
               s = s.replace('android {', 'android {\n    namespace "io.github.edufolly.flutterbluetoothserial"', 1)
-              p.write_text(s)
+          # The legacy plugin declares SDK 30 but its resources use newer
+          # Android attributes (including android:attr/lStar). Compile the
+          # plugin against a modern SDK without changing the app minSdk.
+          s = s.replace('compileSdkVersion 30', 'compileSdkVersion 34')
+          s = s.replace('compileSdkVersion = 30', 'compileSdkVersion = 34')
+          s = s.replace('compileSdk 30', 'compileSdk 34')
+          p.write_text(s)
           print('Patched:', p)
           PY
 
@@ -81,5 +87,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tarczociag-release-apk
-          path: tarczociag_flutter/build/app/outputs/flutter-apk/app-release.apk
+          path: build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
