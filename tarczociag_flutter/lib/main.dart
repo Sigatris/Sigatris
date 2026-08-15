@@ -1,221 +1,467 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-
-  final prefs = await SharedPreferences.getInstance();
-
-  runApp(
-    TargetPullerApp(
-      prefs: prefs,
-    ),
-  );
+void main() {
+  runApp(const TarczociagApp());
 }
 
-class TargetPullerApp extends StatelessWidget {
-  final SharedPreferences prefs;
-
-  const TargetPullerApp({
-    super.key,
-    required this.prefs,
-  });
+class TarczociagApp extends StatefulWidget {
+  const TarczociagApp({super.key});
 
   @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      title: 'Tarczociąg',
-      theme: ThemeData(
-        brightness: Brightness.dark,
-        scaffoldBackgroundColor: const Color(0xFF121212),
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: Colors.blue,
-          brightness: Brightness.dark,
-        ),
-        useMaterial3: true,
-        cardTheme: const CardThemeData(
-          color: Color(0xFF1E1E1E),
-          elevation: 3,
-        ),
-        inputDecorationTheme: InputDecorationTheme(
-          filled: true,
-          fillColor: const Color(0xFF1B1B1B),
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-          ),
-          enabledBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-            borderSide: const BorderSide(
-              color: Color(0xFF383838),
-            ),
-          ),
-        ),
-      ),
-      home: TargetPullerHome(
-        prefs: prefs,
-      ),
-    );
-  }
+  State<TarczociagApp> createState() => _TarczociagAppState();
 }
 
-class TargetPullerHome extends StatefulWidget {
-  final SharedPreferences prefs;
-
-  const TargetPullerHome({
-    super.key,
-    required this.prefs,
-  });
-
-  @override
-  State<TargetPullerHome> createState() => _TargetPullerHomeState();
-}
-
-class _TargetPullerHomeState extends State<TargetPullerHome> {
+class _TarczociagAppState extends State<TarczociagApp>
+    with TickerProviderStateMixin {
   final PageController _pageController = PageController();
 
   BluetoothConnection? _connection;
-  StreamSubscription<Uint8List>? _inputSubscription;
+  List<BluetoothDevice> _pairedDevices = [];
+  bool _isConnected = false;
+  bool _isConnecting = false;
 
-  bool _connecting = false;
-  bool _connected = false;
+  double _positionValue = 0.0;
+  String _positionText = '0.0 m';
+  String _statusMessage = 'Rozłączono';
+  StringBuffer _rxBuffer = StringBuffer();
 
-  String _connectionStatus = 'Rozłączono';
-  String _deviceName = '';
+  List<double> _presetDistances = [10, 25, 33, 50];
+  int _maxMotorSpeed = 200;
+  int _accelRamp = 60;
 
-  double? _position;
-  String _deviceStatus = 'Brak danych';
+  double _targetDistance = 0.0;
+  int _selectedPresetIndex = -1;
+  bool _targetReached = false;
+  bool _timerRunning = false;
+  int _elapsedSeconds = 0;
+  DateTime _now = DateTime.now();
 
-  // Bufor odbieranych danych.
-  String _receiveBuffer = '';
+  Timer? _clockTimer;
+  Timer? _targetTimer;
+  Timer? _longPressResetTimer;
 
-  // Presety dystansów.
-  late double _distance10;
-  late double _distance25;
-  late double _distance33;
-  late double _distance50;
-
-  // Parametry silnika.
-  late int _maxSpeed;
-  late int _ramp;
+  late final AnimationController _pulseController;
+  late final AnimationController _targetGlowController;
 
   @override
   void initState() {
     super.initState();
-    _loadSettings();
-  }
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 500),
+    );
+    _targetGlowController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1200),
+      lowerBound: 0.0,
+      upperBound: 1.0,
+    )..repeat(reverse: true);
 
-  void _loadSettings() {
-    _distance10 = widget.prefs.getDouble('distance10') ?? 10.0;
-    _distance25 = widget.prefs.getDouble('distance25') ?? 25.0;
-    _distance33 = widget.prefs.getDouble('distance33') ?? 33.0;
-    _distance50 = widget.prefs.getDouble('distance50') ?? 50.0;
-
-    _maxSpeed = widget.prefs.getInt('maxSpeed') ?? 200;
-    _ramp = widget.prefs.getInt('ramp') ?? 100;
+    _loadPreferences();
+    _refreshBondedDevices();
+    _startClock();
   }
 
   @override
   void dispose() {
     _pageController.dispose();
-    _disconnect();
+    _connection?.finish();
+    _clockTimer?.cancel();
+    _targetTimer?.cancel();
+    _longPressResetTimer?.cancel();
+    _pulseController.dispose();
+    _targetGlowController.dispose();
     super.dispose();
   }
 
-  // ---------------------------------------------------------------------------
-  // BLUETOOTH
-  // ---------------------------------------------------------------------------
+  void _startClock() {
+    _clockTimer?.cancel();
+    _clockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) {
+        setState(() {
+          _now = DateTime.now();
+        });
+      }
+    });
+  }
 
-  Future<void> _showBluetoothDevices() async {
-    if (_connecting) return;
+  void _startTargetTimer() {
+    if (_timerRunning) return;
 
-    try {
-      final bluetoothState =
-          await FlutterBluetoothSerial.instance.state;
+    _timerRunning = true;
+    _elapsedSeconds = 0;
 
-      if (bluetoothState != BluetoothState.STATE_ON) {
-        if (!mounted) return;
+    _targetTimer?.cancel();
+    _targetTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      setState(() {
+        _elapsedSeconds++;
+      });
+    });
+  }
 
-        await showDialog<void>(
-          context: context,
-          builder: (context) {
-            return AlertDialog(
-              title: const Text('Bluetooth wyłączony'),
-              content: const Text(
-                'Włącz Bluetooth w telefonie, a następnie spróbuj ponownie.',
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text('OK'),
-                ),
-              ],
-            );
-          },
-        );
+  void _stopTargetTimer() {
+    _targetTimer?.cancel();
+    _targetTimer = null;
+    _timerRunning = false;
+  }
 
-        return;
+  void _resetTargetTimer() {
+    _stopTargetTimer();
+    setState(() {
+      _elapsedSeconds = 0;
+      _statusMessage = 'Timer zresetowany';
+    });
+  }
+
+  String _formatElapsedTime() {
+    final minutes = (_elapsedSeconds ~/ 60).toString().padLeft(2, '0');
+    final seconds = (_elapsedSeconds % 60).toString().padLeft(2, '0');
+    return '$minutes:$seconds';
+  }
+
+  String _formatClock() {
+    return '${_now.hour.toString().padLeft(2, '0')}:${_now.minute.toString().padLeft(2, '0')}';
+  }
+
+  Future<void> _loadPreferences() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    if (!mounted) return;
+
+    final savedDistances = prefs.getStringList('preset_distances');
+    final maxSpeed = prefs.getInt('max_motor_speed') ?? 200;
+    final ramp = prefs.getInt('motor_ramp') ?? 60;
+
+    setState(() {
+      if (savedDistances != null && savedDistances.length == 4) {
+        _presetDistances = savedDistances.map((v) {
+          final parsed = double.tryParse(v);
+          return parsed ?? 0.0;
+        }).toList();
       }
 
-      final devices =
-          await FlutterBluetoothSerial.instance.getBondedDevices();
+      _maxMotorSpeed = maxSpeed;
+      _accelRamp = ramp;
+    });
+  }
 
-      if (!mounted) return;
+  Future<void> _persistPreferences() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(
+      'preset_distances',
+      _presetDistances.map((value) => value.toString()).toList(),
+    );
+    await prefs.setInt('max_motor_speed', _maxMotorSpeed);
+    await prefs.setInt('motor_ramp', _accelRamp);
+  }
 
-      await showModalBottomSheet<void>(
-        context: context,
-        backgroundColor: const Color(0xFF1A1A1A),
-        isScrollControlled: true,
-        builder: (context) {
-          return SafeArea(
+  Future<void> _refreshBondedDevices() async {
+    try {
+      final devices = await FlutterBluetoothSerial.instance.getBondedDevices();
+      if (mounted) {
+        setState(() {
+          _pairedDevices = devices;
+        });
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _pairedDevices = [];
+        });
+      }
+    }
+  }
+
+  Future<void> _connectToDevice(BluetoothDevice device) async {
+    if (_isConnecting) return;
+
+    try {
+      setState(() {
+        _isConnecting = true;
+        _statusMessage = 'Nawiązywanie połączenia...';
+      });
+
+      if (_connection != null) {
+        await _connection!.finish();
+      }
+
+      final conn = await BluetoothConnection.toAddress(device.address);
+      _connection = conn;
+
+      _connection!.input!.listen(
+        _handleIncomingData,
+        onDone: () {
+          if (mounted) {
+            setState(() {
+              _isConnected = false;
+              _statusMessage = 'Rozłączono';
+            });
+          }
+        },
+        onError: (_) {
+          if (mounted) {
+            setState(() {
+              _isConnected = false;
+              _statusMessage = 'Błąd połączenia';
+            });
+          }
+        },
+      );
+
+      if (mounted) {
+        setState(() {
+          _isConnected = true;
+          _statusMessage = 'Połączono: ${device.name ?? device.address}';
+        });
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _isConnected = false;
+          _statusMessage = 'Nie udało się połączyć';
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isConnecting = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _disconnect() async {
+    try {
+      await _connection?.finish();
+    } catch (_) {}
+    if (mounted) {
+      setState(() {
+        _connection = null;
+        _isConnected = false;
+        _statusMessage = 'Rozłączono';
+      });
+    }
+  }
+
+  void _handleIncomingData(Uint8List data) {
+    final text = utf8.decode(data, allowMalformed: true);
+    if (text.isEmpty) return;
+
+    _rxBuffer.write(text);
+
+    String remaining = _rxBuffer.toString();
+    while (remaining.contains('\n')) {
+      final lineEnd = remaining.indexOf('\n');
+      final line = remaining.substring(0, lineEnd).trim();
+      remaining = remaining.substring(lineEnd + 1);
+      _processFrame(line);
+    }
+
+    _rxBuffer = StringBuffer(remaining);
+  }
+
+  void _processFrame(String frame) {
+    if (frame.isEmpty) return;
+
+    if (frame.startsWith('POS:')) {
+      final raw = frame.substring(4).trim();
+      final parsed = double.tryParse(raw);
+      if (parsed != null) {
+        setState(() {
+          _positionValue = parsed;
+          _positionText = '${parsed.toStringAsFixed(1)} m';
+        });
+
+        _evaluateTargetStatus(parsed);
+      }
+      return;
+    }
+
+    if (frame == 'STATUS:HOME_OK') {
+      setState(() {
+        _statusMessage = 'Powrót zakończony';
+        _targetReached = false;
+      });
+      _stopTargetTimer();
+      return;
+    }
+
+    if (frame.startsWith('STATUS:ARRIVED:')) {
+      final raw = frame.substring('STATUS:ARRIVED:'.length).trim();
+      final targetValue = double.tryParse(raw);
+      if (targetValue != null) {
+        setState(() {
+          _targetDistance = targetValue;
+          _targetReached = true;
+          _statusMessage = 'Cel osiągnięty: ${targetValue.toStringAsFixed(1)} m';
+        });
+        _startTargetTimer();
+      } else {
+        setState(() {
+          _targetReached = true;
+          _statusMessage = 'Cel osiągnięty';
+        });
+        _startTargetTimer();
+      }
+      return;
+    }
+
+    if (frame == 'CFG:OK') {
+      setState(() {
+        _statusMessage = 'Konfiguracja zapisana';
+      });
+      return;
+    }
+
+    if (frame.startsWith('STATUS:')) {
+      setState(() {
+        _statusMessage = frame;
+      });
+    }
+  }
+
+  void _evaluateTargetStatus(double currentPosition) {
+    if (_targetDistance <= 0) return;
+
+    final diff = (currentPosition - _targetDistance).abs();
+    if (diff <= 0.5 && !_targetReached) {
+      setState(() {
+        _targetReached = true;
+        _statusMessage = 'Cel osiągnięty: ${_targetDistance.toStringAsFixed(1)} m';
+      });
+      _startTargetTimer();
+    }
+  }
+
+  Future<void> _sendCommand(String command) async {
+    if (_connection == null || !_isConnected) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Najpierw połącz urządzenie Bluetooth.'),
+          ),
+        );
+      }
+      return;
+    }
+
+    try {
+      _connection!.output.add(Uint8List.fromList(utf8.encode(command)));
+      await _connection!.output.allSent;
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Nie udało się wysłać komendy do urządzenia.'),
+          ),
+        );
+      }
+    }
+  }
+
+  void _activatePreset(int index) {
+    final value = _presetDistances[index].toInt();
+    setState(() {
+      _selectedPresetIndex = index;
+      _targetDistance = value.toDouble();
+      _targetReached = false;
+      _timerRunning = false;
+      _elapsedSeconds = 0;
+      _statusMessage = 'Wybrano cel: ${value}m';
+    });
+    _stopTargetTimer();
+    _pulseController.forward(from: 0.0);
+
+    _sendCommand('JEDZ:$value\n');
+  }
+
+  void _sendHome() {
+    setState(() {
+      _targetReached = false;
+      _statusMessage = 'Powrót do pozycji home';
+    });
+    _stopTargetTimer();
+    _sendCommand('HOME\n');
+  }
+
+  void _showDevicePicker() async {
+    await _refreshBondedDevices();
+
+    if (!mounted) return;
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) {
+        return Container(
+          decoration: const BoxDecoration(
+            color: Color(0xFF1E1E1E),
+            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+          ),
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.of(context).size.height * 0.7,
+          ),
+          child: SafeArea(
             child: Padding(
               padding: const EdgeInsets.all(16),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Text(
-                    'Sparowane urządzenia',
-                    style: TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.bold,
+                  Container(
+                    width: 56,
+                    height: 5,
+                    margin: const EdgeInsets.only(bottom: 12),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withOpacity(0.35),
+                      borderRadius: BorderRadius.circular(10),
                     ),
                   ),
-                  const SizedBox(height: 12),
-                  if (devices.isEmpty)
+                  const Text(
+                    'Wybierz urządzenie Bluetooth',
+                    style: TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  if (_pairedDevices.isEmpty)
                     const Padding(
-                      padding: EdgeInsets.all(30),
+                      padding: EdgeInsets.symmetric(vertical: 24),
                       child: Text(
                         'Brak sparowanych urządzeń Bluetooth.',
-                        textAlign: TextAlign.center,
+                        style: TextStyle(color: Colors.white70),
                       ),
                     )
                   else
                     Flexible(
                       child: ListView.separated(
                         shrinkWrap: true,
-                        itemCount: devices.length,
-                        separatorBuilder: (_, __) =>
-                            const Divider(height: 1),
+                        itemCount: _pairedDevices.length,
+                        separatorBuilder: (_, __) => const Divider(
+                          color: Color(0xFF2B2B2B),
+                        ),
                         itemBuilder: (context, index) {
-                          final device = devices[index];
-
+                          final device = _pairedDevices[index];
                           return ListTile(
-                            leading: const CircleAvatar(
-                              child: Icon(Icons.bluetooth),
+                            leading: const Icon(
+                              Icons.bluetooth,
+                              color: Color(0xFF5DA9E9),
                             ),
                             title: Text(
-                              device.name?.isNotEmpty == true
-                                  ? device.name!
-                                  : 'Nieznane urządzenie',
+                              device.name ?? 'Nieznane urządzenie',
+                              style: const TextStyle(color: Colors.white),
                             ),
-                            subtitle: Text(device.address),
-                            trailing: const Icon(
-                              Icons.chevron_right,
+                            subtitle: Text(
+                              device.address,
+                              style: const TextStyle(color: Colors.white70),
                             ),
                             onTap: () {
                               Navigator.pop(context);
@@ -225,367 +471,134 @@ class _TargetPullerHomeState extends State<TargetPullerHome> {
                         },
                       ),
                     ),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    child: TextButton.icon(
+                      onPressed: () {
+                        Navigator.pop(context);
+                        _refreshBondedDevices();
+                      },
+                      icon: const Icon(Icons.refresh),
+                      label: const Text('Odśwież listę'),
+                      style: TextButton.styleFrom(
+                        foregroundColor: Colors.white,
+                        backgroundColor: const Color(0xFF2B2B2B),
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                      ),
+                    ),
+                  ),
                 ],
               ),
             ),
-          );
+          ),
+        );
+      },
+    );
+  }
+
+  void _showSettingsSheet() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) => SettingsSheet(
+        initialDistances: _presetDistances,
+        initialMaxSpeed: _maxMotorSpeed,
+        initialRamp: _accelRamp,
+        onSave: (distances, maxSpeed, ramp) async {
+          setState(() {
+            _presetDistances = distances;
+            _maxMotorSpeed = maxSpeed;
+            _accelRamp = ramp;
+          });
+
+          await _persistPreferences();
+
+          if (_isConnected) {
+            _sendCommand('SET_DIST:${_distanceCommandString()}\n');
+            _sendCommand('SET_MOTOR:${_maxMotorSpeed},${_accelRamp}\n');
+          }
         },
-      );
-    } catch (e) {
-      _showMessage('Błąd Bluetooth: $e');
-    }
-  }
-
-  Future<void> _connectToDevice(BluetoothDevice device) async {
-    if (_connecting) return;
-
-    await _disconnect();
-
-    if (!mounted) return;
-
-    setState(() {
-      _connecting = true;
-      _connectionStatus = 'Łączenie...';
-      _deviceName = device.name?.isNotEmpty == true
-          ? device.name!
-          : device.address;
-    });
-
-    try {
-      final connection =
-          await BluetoothConnection.toAddress(device.address);
-
-      if (!mounted) {
-        connection.dispose();
-        return;
-      }
-
-      _connection = connection;
-
-      setState(() {
-        _connecting = false;
-        _connected = true;
-        _connectionStatus = 'Połączono';
-      });
-
-      _startListening();
-
-      _showMessage(
-        'Połączono z ${_deviceName.isNotEmpty ? _deviceName : device.address}',
-      );
-    } catch (e) {
-      if (!mounted) return;
-
-      setState(() {
-        _connecting = false;
-        _connected = false;
-        _connectionStatus = 'Rozłączono';
-      });
-
-      _showMessage('Nie udało się połączyć: $e');
-    }
-  }
-
-  void _startListening() {
-    final input = _connection?.input;
-
-    if (input == null) {
-      return;
-    }
-
-    _inputSubscription?.cancel();
-
-    _inputSubscription = input.listen(
-      _onBluetoothData,
-      onError: (error) {
-        _handleConnectionLost('Błąd odbioru: $error');
-      },
-      onDone: () {
-        _handleConnectionLost('Połączenie zostało zamknięte.');
-      },
-      cancelOnError: false,
-    );
-  }
-
-  void _onBluetoothData(Uint8List data) {
-    try {
-      final text = utf8.decode(
-        data,
-        allowMalformed: true,
-      );
-
-      _receiveBuffer += text;
-
-      // ESP32 wysyła ramki zakończone \n.
-      while (_receiveBuffer.contains('\n')) {
-        final newlineIndex = _receiveBuffer.indexOf('\n');
-
-        String frame =
-            _receiveBuffer.substring(0, newlineIndex);
-
-        _receiveBuffer =
-            _receiveBuffer.substring(newlineIndex + 1);
-
-        frame = frame.trim();
-
-        if (frame.isEmpty) {
-          continue;
-        }
-
-        _processFrame(frame);
-      }
-
-      // Zabezpieczenie przed niekontrolowanym wzrostem bufora
-      // w przypadku uszkodzonych danych.
-      if (_receiveBuffer.length > 4096) {
-        _receiveBuffer =
-            _receiveBuffer.substring(_receiveBuffer.length - 1024);
-      }
-    } catch (e) {
-      debugPrint('Bluetooth parser error: $e');
-    }
-  }
-
-  void _processFrame(String frame) {
-    debugPrint('BT RX: $frame');
-
-    // POS:18.4
-    if (frame.startsWith('POS:')) {
-      final value = double.tryParse(
-        frame.substring(4).trim(),
-      );
-
-      if (value != null && mounted) {
-        setState(() {
-          _position = value;
-        });
-      }
-
-      return;
-    }
-
-    // STATUS:HOME_OK
-    if (frame == 'STATUS:HOME_OK') {
-      if (mounted) {
-        setState(() {
-          _deviceStatus = 'HOME OK';
-          _position = 0.0;
-        });
-      }
-
-      return;
-    }
-
-    // STATUS:ARRIVED:X
-    if (frame.startsWith('STATUS:ARRIVED:')) {
-      final value =
-          frame.substring('STATUS:ARRIVED:'.length);
-
-      if (mounted) {
-        setState(() {
-          _deviceStatus = 'Osiągnięto $value m';
-        });
-      }
-
-      return;
-    }
-
-    // CFG:OK
-    if (frame == 'CFG:OK') {
-      if (mounted) {
-        setState(() {
-          _deviceStatus = 'Konfiguracja OK';
-        });
-      }
-
-      _showMessage('Urządzenie potwierdziło konfigurację.');
-      return;
-    }
-
-    // Można łatwo rozszerzyć o kolejne ramki.
-    if (mounted) {
-      setState(() {
-        _deviceStatus = frame;
-      });
-    }
-  }
-
-  Future<void> _sendCommand(String command) async {
-    if (!_connected || _connection == null) {
-      _showMessage('Brak połączenia z tarczociągiem.');
-      return;
-    }
-
-    try {
-      final bytes = Uint8List.fromList(
-        utf8.encode(command),
-      );
-
-      _connection!.output.add(bytes);
-
-      await _connection!.output.allSent;
-
-      debugPrint('BT TX: ${command.trim()}');
-    } catch (e) {
-      _handleConnectionLost(
-        'Nie udało się wysłać polecenia: $e',
-      );
-    }
-  }
-
-  Future<void> _disconnect() async {
-    final subscription = _inputSubscription;
-    _inputSubscription = null;
-
-    await subscription?.cancel();
-
-    final connection = _connection;
-    _connection = null;
-
-    try {
-      await connection?.finish();
-    } catch (_) {
-      try {
-        connection?.dispose();
-      } catch (_) {}
-    }
-
-    if (mounted) {
-      setState(() {
-        _connected = false;
-        _connecting = false;
-        _connectionStatus = 'Rozłączono';
-      });
-    }
-  }
-
-  void _handleConnectionLost(String reason) {
-    _inputSubscription?.cancel();
-    _inputSubscription = null;
-
-    try {
-      _connection?.dispose();
-    } catch (_) {}
-
-    _connection = null;
-
-    if (mounted) {
-      setState(() {
-        _connected = false;
-        _connecting = false;
-        _connectionStatus = 'Rozłączono';
-        _deviceStatus = 'Brak połączenia';
-      });
-
-      _showMessage(reason);
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // SETTINGS
-  // ---------------------------------------------------------------------------
-
-  Future<void> _saveDistances({
-    required double d10,
-    required double d25,
-    required double d33,
-    required double d50,
-  }) async {
-    await widget.prefs.setDouble('distance10', d10);
-    await widget.prefs.setDouble('distance25', d25);
-    await widget.prefs.setDouble('distance33', d33);
-    await widget.prefs.setDouble('distance50', d50);
-
-    if (mounted) {
-      setState(() {
-        _distance10 = d10;
-        _distance25 = d25;
-        _distance33 = d33;
-        _distance50 = d50;
-      });
-    }
-
-    await _sendCommand(
-      'SET_DIST:${_formatNumber(d10)},'
-      '${_formatNumber(d25)},'
-      '${_formatNumber(d33)},'
-      '${_formatNumber(d50)}\n',
-    );
-  }
-
-  Future<void> _saveMotorSettings({
-    required int maxSpeed,
-    required int ramp,
-  }) async {
-    await widget.prefs.setInt('maxSpeed', maxSpeed);
-    await widget.prefs.setInt('ramp', ramp);
-
-    if (mounted) {
-      setState(() {
-        _maxSpeed = maxSpeed;
-        _ramp = ramp;
-      });
-    }
-
-    await _sendCommand(
-      'SET_MOTOR:$maxSpeed,$ramp\n',
-    );
-  }
-
-  String _formatNumber(double value) {
-    if (value == value.roundToDouble()) {
-      return value.toInt().toString();
-    }
-
-    return value
-        .toStringAsFixed(1)
-        .replaceAll(RegExp(r'\.?0+$'), '');
-  }
-
-  Future<void> _openSettings() async {
-    await Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => SettingsPage(
-          distance10: _distance10,
-          distance25: _distance25,
-          distance33: _distance33,
-          distance50: _distance50,
-          maxSpeed: _maxSpeed,
-          ramp: _ramp,
-          onSaveDistances: _saveDistances,
-          onSaveMotorSettings: _saveMotorSettings,
-        ),
       ),
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // UI
-  // ---------------------------------------------------------------------------
-
-  void _showMessage(String message) {
-    if (!mounted) return;
-
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(
-        SnackBar(
-          content: Text(message),
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
+  String _distanceCommandString() {
+    return _presetDistances.map((value) => value.toInt()).join(',');
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: SafeArea(
-        child: PageView(
+    return MaterialApp(
+      title: 'Tarczociąg BT',
+      debugShowCheckedModeBanner: false,
+      theme: _buildDarkTheme(),
+      home: Scaffold(
+        appBar: AppBar(
+          title: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 10,
+                height: 10,
+                decoration: BoxDecoration(
+                  color: _isConnected ? Colors.green : Colors.red,
+                  shape: BoxShape.circle,
+                  boxShadow: [
+                    BoxShadow(
+                      color: (_isConnected ? Colors.green : Colors.red).withOpacity(0.5),
+                      blurRadius: 8,
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 10),
+              Text(
+                _isConnected ? 'Połączono' : 'Rozłączono',
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+            ],
+          ),
+          actions: [
+            if (_isConnecting)
+              const Padding(
+                padding: EdgeInsets.only(right: 12),
+                child: SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                  ),
+                ),
+              )
+            else
+              TextButton.icon(
+                onPressed: _showDevicePicker,
+                icon: const Icon(Icons.bluetooth_connected_rounded),
+                label: const Text('Połącz'),
+                style: TextButton.styleFrom(
+                  foregroundColor: Colors.white,
+                  backgroundColor: const Color(0xFF2D3F5C),
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+              ),
+            IconButton(
+              onPressed: _showSettingsSheet,
+              icon: const Icon(Icons.settings),
+              tooltip: 'Ustawienia',
+            ),
+          ],
+        ),
+        body: PageView(
           controller: _pageController,
-          physics: const BouncingScrollPhysics(),
           children: [
             _buildMainPage(),
-            _buildCydPlaceholder(),
+            _buildCydPage(),
           ],
         ),
       ),
@@ -593,428 +606,285 @@ class _TargetPullerHomeState extends State<TargetPullerHome> {
   }
 
   Widget _buildMainPage() {
-    return Column(
-      children: [
-        _buildAppBar(),
-
-        Expanded(
-          child: SingleChildScrollView(
-            physics: const BouncingScrollPhysics(),
-            padding: const EdgeInsets.fromLTRB(
-              16,
-              8,
-              16,
-              16,
+    return SafeArea(
+      child: Stack(
+        children: [
+          Positioned(
+            top: 14,
+            left: 16,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1A1A1A),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: const Color(0xFF2A2A2A)),
+              ),
+              child: Text(
+                _formatClock(),
+                style: const TextStyle(
+                  fontSize: 22,
+                  fontWeight: FontWeight.w700,
+                  color: Colors.white,
+                ),
+              ),
             ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 60, 16, 16),
             child: Column(
               children: [
-                _buildPositionCard(),
-
-                const SizedBox(height: 16),
-
-                _buildPresetGrid(),
-
-                const SizedBox(height: 18),
-
-                _buildHomeButton(),
-
-                const SizedBox(height: 10),
-
-                _buildDeviceStatus(),
-              ],
-            ),
-          ),
-        ),
-
-        _buildPageIndicator(),
-      ],
-    );
-  }
-
-  Widget _buildAppBar() {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(16, 12, 8, 12),
-      decoration: const BoxDecoration(
-        color: Color(0xFF181818),
-        border: Border(
-          bottom: BorderSide(
-            color: Color(0xFF2A2A2A),
-          ),
-        ),
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            child: Row(
-              children: [
-                Container(
-                  width: 11,
-                  height: 11,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: _connected
-                        ? Colors.greenAccent
-                        : Colors.redAccent,
-                    boxShadow: [
-                      BoxShadow(
-                        color: (_connected
-                                ? Colors.greenAccent
-                                : Colors.redAccent)
-                            .withValues(alpha: 0.4),
-                        blurRadius: 8,
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(width: 9),
-                Flexible(
-                  child: Column(
-                    crossAxisAlignment:
-                        CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        _connectionStatus,
-                        style: const TextStyle(
-                          fontWeight: FontWeight.bold,
+                const SizedBox(height: 8),
+                AnimatedBuilder(
+                  animation: _pulseController,
+                  builder: (context, child) {
+                    final scale = 0.94 + (_pulseController.value * 0.14);
+                    return Transform.scale(
+                      scale: scale,
+                      child: child,
+                    );
+                  },
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(18),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1D1D1D),
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(color: const Color(0xFF2A2A2A)),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.blue.withOpacity(0.18 + (_pulseController.value * 0.2)),
+                          blurRadius: 20,
+                          spreadRadius: 1,
                         ),
-                      ),
-                      if (_deviceName.isNotEmpty)
+                      ],
+                    ),
+                    child: Column(
+                      children: [
+                        const Text(
+                          'Pozycja',
+                          style: TextStyle(fontSize: 18, color: Colors.white70),
+                        ),
+                        const SizedBox(height: 8),
                         Text(
-                          _deviceName,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            color: Colors.grey.shade500,
-                            fontSize: 11,
+                          _positionText,
+                          style: const TextStyle(
+                            fontSize: 42,
+                            fontWeight: FontWeight.w800,
+                            color: Colors.white,
                           ),
                         ),
-                    ],
+                        const SizedBox(height: 8),
+                        if (_targetDistance > 0)
+                          Text(
+                            'Cel: ${_targetDistance.toStringAsFixed(0)} m',
+                            style: const TextStyle(
+                              fontSize: 15,
+                              color: Color(0xFF86C9FF),
+                              fontWeight: FontWeight.w600,
+                            ),
+                          )
+                        else
+                          const Text(
+                            'Brak celu',
+                            style: TextStyle(
+                              fontSize: 15,
+                              color: Colors.white38,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 18),
+                GestureDetector(
+                  onLongPressStart: (_) {
+                    _longPressResetTimer?.cancel();
+                    _longPressResetTimer = Timer(const Duration(seconds: 3), () {
+                      _resetTargetTimer();
+                    });
+                  },
+                  onLongPressEnd: (_) {
+                    _longPressResetTimer?.cancel();
+                  },
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1A1A1A),
+                      borderRadius: BorderRadius.circular(18),
+                      border: Border.all(color: const Color(0xFF2A2A2A)),
+                    ),
+                    child: Column(
+                      children: [
+                        const Text(
+                          'Czas od celu',
+                          style: TextStyle(
+                            fontSize: 14,
+                            color: Colors.white60,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          _formatElapsedTime(),
+                          style: TextStyle(
+                            fontSize: 34,
+                            fontWeight: FontWeight.w800,
+                            color: _timerRunning
+                                ? const Color(0xFF7EE8A6)
+                                : Colors.white38,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        const Text(
+                          'Przytrzymaj 3s, aby zresetować',
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: Colors.white38,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+                Expanded(
+                  child: GridView.count(
+                    crossAxisCount: 2,
+                    mainAxisSpacing: 16,
+                    crossAxisSpacing: 16,
+                    childAspectRatio: 1.3,
+                    children: List.generate(4, (index) {
+                      final distance = _presetDistances[index];
+                      final isSelected = _selectedPresetIndex == index;
+
+                      return AnimatedScale(
+                        scale: isSelected ? 1.05 : 1.0,
+                        duration: const Duration(milliseconds: 220),
+                        child: Material(
+                          color: _tileColor(index),
+                          borderRadius: BorderRadius.circular(18),
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(18),
+                            onTap: () => _activatePreset(index),
+                            child: Center(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    '${distance.toInt()} m',
+                                    style: const TextStyle(
+                                      fontSize: 28,
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                                  if (isSelected)
+                                    const Padding(
+                                      padding: EdgeInsets.only(top: 8),
+                                      child: Icon(
+                                        Icons.check_circle_rounded,
+                                        color: Colors.white,
+                                        size: 22,
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      );
+                    }),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                SizedBox(
+                  width: double.infinity,
+                  height: 64,
+                  child: ElevatedButton.icon(
+                    onPressed: _sendHome,
+                    icon: const Icon(Icons.home_rounded, size: 28),
+                    label: const Text(
+                      'POWRÓT (HOME)',
+                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFFEE8E28),
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                    ),
                   ),
                 ),
               ],
             ),
-          ),
-
-          if (_connecting)
-            const Padding(
-              padding: EdgeInsets.symmetric(horizontal: 12),
-              child: SizedBox(
-                width: 22,
-                height: 22,
-                child: CircularProgressIndicator(
-                  strokeWidth: 2,
-                ),
-              ),
-            )
-          else
-            FilledButton.icon(
-              onPressed: _connected
-                  ? _disconnect
-                  : _showBluetoothDevices,
-              icon: Icon(
-                _connected
-                    ? Icons.bluetooth_disabled
-                    : Icons.bluetooth,
-                size: 18,
-              ),
-              label: Text(
-                _connected ? 'Rozłącz' : 'Połącz',
-              ),
-              style: FilledButton.styleFrom(
-                backgroundColor: _connected
-                    ? Colors.red.shade800
-                    : Colors.blue.shade700,
-              ),
-            ),
-
-          const SizedBox(width: 4),
-
-          IconButton(
-            tooltip: 'Ustawienia',
-            onPressed: _openSettings,
-            icon: const Icon(Icons.settings),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildPositionCard() {
-    final positionText = _position == null
-        ? '--.-'
-        : _position!.toStringAsFixed(1);
-
-    return Card(
-      margin: EdgeInsets.zero,
-      child: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(
-          vertical: 28,
-          horizontal: 16,
-        ),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(12),
-          gradient: const LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-            colors: [
-              Color(0xFF202020),
-              Color(0xFF181818),
-            ],
-          ),
-        ),
-        child: Column(
-          children: [
-            Text(
-              'AKTUALNA POZYCJA',
-              style: TextStyle(
-                color: Colors.grey.shade500,
-                letterSpacing: 1.8,
-                fontSize: 12,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 8),
-            FittedBox(
-              child: Text(
-                '$positionText m',
-                style: const TextStyle(
-                  fontSize: 58,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: 2,
-                ),
-              ),
-            ),
-            const SizedBox(height: 6),
-            Text(
-              _connected
-                  ? 'Dane z tarczociągu'
-                  : 'Oczekiwanie na połączenie',
-              style: TextStyle(
-                color: _connected
-                    ? Colors.greenAccent
-                    : Colors.grey.shade600,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildPresetGrid() {
-    return GridView.count(
-      crossAxisCount: 2,
-      crossAxisSpacing: 12,
-      mainAxisSpacing: 12,
-      childAspectRatio: 1.55,
-      shrinkWrap: true,
-      physics: const NeverScrollableScrollPhysics(),
-      children: [
-        _buildPresetTile(
-          label: '10 m',
-          value: _distance10,
-          color: Colors.blue,
-        ),
-        _buildPresetTile(
-          label: '25 m',
-          value: _distance25,
-          color: Colors.green,
-        ),
-        _buildPresetTile(
-          label: '33 m',
-          value: _distance33,
-          color: Colors.orange,
-        ),
-        _buildPresetTile(
-          label: '50 m',
-          value: _distance50,
-          color: Colors.deepPurple,
-        ),
-      ],
-    );
-  }
-
-  Widget _buildPresetTile({
-    required String label,
-    required double value,
-    required MaterialColor color,
-  }) {
-    return Material(
-      color: color.shade900.withValues(alpha: 0.55),
-      borderRadius: BorderRadius.circular(16),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(16),
-        onTap: () {
-          _sendCommand(
-            'JEDZ:${_formatNumber(value)}\n',
-          );
-
-          if (mounted) {
-            setState(() {
-              _deviceStatus =
-                  'Jazda do ${_formatNumber(value)} m';
-            });
-          }
-        },
-        child: Container(
-          padding: const EdgeInsets.all(16),
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(
-              color: color.shade700.withValues(alpha: 0.6),
-            ),
-          ),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(
-                Icons.straighten,
-                color: color.shade200,
-                size: 25,
-              ),
-              const SizedBox(height: 7),
-              Text(
-                label,
-                style: const TextStyle(
-                  fontSize: 23,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              Text(
-                'JEDŹ',
-                style: TextStyle(
-                  color: color.shade200,
-                  fontSize: 11,
-                  letterSpacing: 1.2,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildHomeButton() {
-    return SizedBox(
-      width: double.infinity,
-      height: 76,
-      child: FilledButton.icon(
-        onPressed: () {
-          _sendCommand('HOME\n');
-
-          if (mounted) {
-            setState(() {
-              _deviceStatus = 'Powrót do HOME...';
-            });
-          }
-        },
-        icon: const Icon(
-          Icons.home,
-          size: 31,
-        ),
-        label: const Text(
-          'POWRÓT  •  HOME',
-          style: TextStyle(
-            fontSize: 20,
-            fontWeight: FontWeight.bold,
-            letterSpacing: 0.8,
-          ),
-        ),
-        style: FilledButton.styleFrom(
-          backgroundColor: Colors.red.shade800,
-          foregroundColor: Colors.white,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildDeviceStatus() {
-    return Card(
-      margin: EdgeInsets.zero,
+  Widget _buildCydPage() {
+    return SafeArea(
       child: Padding(
-        padding: const EdgeInsets.symmetric(
-          horizontal: 14,
-          vertical: 11,
-        ),
-        child: Row(
-          children: [
-            Icon(
-              Icons.info_outline,
-              color: Colors.grey.shade500,
-              size: 20,
-            ),
-            const SizedBox(width: 9),
-            Expanded(
-              child: Text(
-                _deviceStatus,
-                style: TextStyle(
-                  color: Colors.grey.shade400,
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildCydPlaceholder() {
-    return Padding(
-      padding: const EdgeInsets.all(20),
-      child: Center(
-        child: Card(
+        padding: const EdgeInsets.all(16),
+        child: Center(
           child: Container(
             width: double.infinity,
-            padding: const EdgeInsets.all(30),
+            padding: const EdgeInsets.all(24),
+            decoration: BoxDecoration(
+              color: const Color(0xFF1B1B1B),
+              borderRadius: BorderRadius.circular(22),
+              border: Border.all(color: const Color(0xFF2B2B2B)),
+            ),
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(
-                  Icons.touch_app,
-                  size: 64,
-                  color: Colors.blue.shade300,
+                const Icon(
+                  Icons.smart_screen_rounded,
+                  size: 56,
+                  color: Color(0xFF5DA9E9),
                 ),
-                const SizedBox(height: 20),
+                const SizedBox(height: 18),
                 const Text(
                   'Moduł Pulpitu CYD',
                   textAlign: TextAlign.center,
                   style: TextStyle(
-                    fontSize: 25,
-                    fontWeight: FontWeight.bold,
+                    fontSize: 26,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white,
                   ),
                 ),
                 const SizedBox(height: 12),
-                Text(
-                  'Oczekiwanie na połączenie/konfigurację',
+                const Text(
+                  'Oczekiwanie na połączenie / konfigurację',
                   textAlign: TextAlign.center,
                   style: TextStyle(
-                    color: Colors.grey.shade500,
-                    fontSize: 15,
+                    fontSize: 16,
+                    color: Colors.white70,
+                    height: 1.5,
                   ),
                 ),
-                const SizedBox(height: 22),
+                const SizedBox(height: 20),
                 Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 14,
-                    vertical: 9,
-                  ),
+                  padding: const EdgeInsets.all(14),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF151515),
-                    borderRadius: BorderRadius.circular(10),
+                    color: const Color(0xFF121212),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: const Color(0xFF2A2A2A)),
                   ),
-                  child: const Text(
-                    'CYD • ESP32 • PRZYSZŁY MODUŁ',
-                    style: TextStyle(
-                      color: Colors.blueAccent,
-                      fontSize: 11,
-                      letterSpacing: 1,
-                    ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: const [
+                      Icon(Icons.info_outline, color: Colors.orange),
+                      SizedBox(width: 10),
+                      Text(
+                        'Przygotowane do przyszłej integracji z modułem ESP32',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: Colors.white70),
+                      ),
+                    ],
                   ),
                 ),
               ],
@@ -1025,516 +895,234 @@ class _TargetPullerHomeState extends State<TargetPullerHome> {
     );
   }
 
-  Widget _buildPageIndicator() {
-    return Container(
-      padding: const EdgeInsets.only(bottom: 8),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          _indicator(true),
-          const SizedBox(width: 7),
-          _indicator(false),
-        ],
-      ),
-    );
+  Color _tileColor(int index) {
+    final colors = [
+      const Color(0xFF3A6EA5),
+      const Color(0xFF2B8C6D),
+      const Color(0xFFd97706),
+      const Color(0xFF5A4FCF),
+    ];
+    return colors[index % colors.length];
   }
 
-  Widget _indicator(bool active) {
-    return AnimatedContainer(
-      duration: const Duration(milliseconds: 200),
-      width: active ? 24 : 7,
-      height: 7,
-      decoration: BoxDecoration(
-        color: active
-            ? Colors.blueAccent
-            : Colors.grey.shade700,
-        borderRadius: BorderRadius.circular(10),
+  ThemeData _buildDarkTheme() {
+    return ThemeData(
+      useMaterial3: true,
+      brightness: Brightness.dark,
+      scaffoldBackgroundColor: const Color(0xFF121212),
+      primaryColor: const Color(0xFF5DA9E9),
+      colorScheme: const ColorScheme.dark(
+        primary: Color(0xFF5DA9E9),
+        secondary: Color(0xFF3DDC97),
+        surface: Color(0xFF1E1E1E),
+        background: Color(0xFF121212),
+      ),
+      appBarTheme: const AppBarTheme(
+        backgroundColor: Color(0xFF1D1D1D),
+        foregroundColor: Colors.white,
+        elevation: 0,
+      ),
+      cardColor: const Color(0xFF1E1E1E),
+      dialogBackgroundColor: const Color(0xFF1E1E1E),
+      textTheme: const TextTheme(
+        bodyLarge: TextStyle(color: Colors.white),
+        bodyMedium: TextStyle(color: Colors.white),
       ),
     );
   }
 }
 
-// ============================================================================
-// SETTINGS PAGE
-// ============================================================================
+class SettingsSheet extends StatefulWidget {
+  final List<double> initialDistances;
+  final int initialMaxSpeed;
+  final int initialRamp;
+  final Function(List<double>, int, int) onSave;
 
-class SettingsPage extends StatefulWidget {
-  final double distance10;
-  final double distance25;
-  final double distance33;
-  final double distance50;
-
-  final int maxSpeed;
-  final int ramp;
-
-  final Future<void> Function({
-    required double d10,
-    required double d25,
-    required double d33,
-    required double d50,
-  }) onSaveDistances;
-
-  final Future<void> Function({
-    required int maxSpeed,
-    required int ramp,
-  }) onSaveMotorSettings;
-
-  const SettingsPage({
+  const SettingsSheet({
     super.key,
-    required this.distance10,
-    required this.distance25,
-    required this.distance33,
-    required this.distance50,
-    required this.maxSpeed,
-    required this.ramp,
-    required this.onSaveDistances,
-    required this.onSaveMotorSettings,
+    required this.initialDistances,
+    required this.initialMaxSpeed,
+    required this.initialRamp,
+    required this.onSave,
   });
 
   @override
-  State<SettingsPage> createState() => _SettingsPageState();
+  State<SettingsSheet> createState() => _SettingsSheetState();
 }
 
-class _SettingsPageState extends State<SettingsPage> {
-  late final TextEditingController _d10;
-  late final TextEditingController _d25;
-  late final TextEditingController _d33;
-  late final TextEditingController _d50;
-
-  late final TextEditingController _maxSpeed;
-  late final TextEditingController _ramp;
-
-  bool _savingDistances = false;
-  bool _savingMotor = false;
+class _SettingsSheetState extends State<SettingsSheet> {
+  late final List<TextEditingController> _distanceControllers;
+  late final TextEditingController _maxSpeedController;
+  late final TextEditingController _rampController;
 
   @override
   void initState() {
     super.initState();
-
-    _d10 = TextEditingController(
-      text: _formatNumber(widget.distance10),
+    _distanceControllers = List.generate(
+      4,
+      (index) => TextEditingController(
+        text: widget.initialDistances[index].toStringAsFixed(0),
+      ),
     );
-    _d25 = TextEditingController(
-      text: _formatNumber(widget.distance25),
-    );
-    _d33 = TextEditingController(
-      text: _formatNumber(widget.distance33),
-    );
-    _d50 = TextEditingController(
-      text: _formatNumber(widget.distance50),
-    );
-
-    _maxSpeed = TextEditingController(
-      text: widget.maxSpeed.toString(),
-    );
-    _ramp = TextEditingController(
-      text: widget.ramp.toString(),
-    );
+    _maxSpeedController =
+        TextEditingController(text: widget.initialMaxSpeed.toString());
+    _rampController = TextEditingController(text: widget.initialRamp.toString());
   }
 
   @override
   void dispose() {
-    _d10.dispose();
-    _d25.dispose();
-    _d33.dispose();
-    _d50.dispose();
-    _maxSpeed.dispose();
-    _ramp.dispose();
+    for (final controller in _distanceControllers) {
+      controller.dispose();
+    }
+    _maxSpeedController.dispose();
+    _rampController.dispose();
     super.dispose();
-  }
-
-  String _formatNumber(double value) {
-    if (value == value.roundToDouble()) {
-      return value.toInt().toString();
-    }
-
-    return value.toString();
-  }
-
-  double? _parseDistance(
-    TextEditingController controller,
-  ) {
-    return double.tryParse(
-      controller.text.trim().replaceAll(',', '.'),
-    );
-  }
-
-  int? _parseInt(
-    TextEditingController controller,
-  ) {
-    return int.tryParse(
-      controller.text.trim(),
-    );
-  }
-
-  Future<void> _saveDistances() async {
-    final d10 = _parseDistance(_d10);
-    final d25 = _parseDistance(_d25);
-    final d33 = _parseDistance(_d33);
-    final d50 = _parseDistance(_d50);
-
-    if (d10 == null ||
-        d25 == null ||
-        d33 == null ||
-        d50 == null ||
-        d10 <= 0 ||
-        d25 <= 0 ||
-        d33 <= 0 ||
-        d50 <= 0) {
-      _showError(
-        'Wszystkie dystanse muszą być poprawnymi liczbami większymi od 0.',
-      );
-      return;
-    }
-
-    setState(() {
-      _savingDistances = true;
-    });
-
-    try {
-      await widget.onSaveDistances(
-        d10: d10,
-        d25: d25,
-        d33: d33,
-        d50: d50,
-      );
-
-      if (!mounted) return;
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Dystanse zapisane. Wysłano SET_DIST.',
-          ),
-        ),
-      );
-    } finally {
-      if (mounted) {
-        setState(() {
-          _savingDistances = false;
-        });
-      }
-    }
-  }
-
-  Future<void> _saveMotor() async {
-    final maxSpeed = _parseInt(_maxSpeed);
-    final ramp = _parseInt(_ramp);
-
-    if (maxSpeed == null ||
-        maxSpeed < 50 ||
-        maxSpeed > 255) {
-      _showError(
-        'Maksymalna prędkość PWM musi być w zakresie 50–255.',
-      );
-      return;
-    }
-
-    if (ramp == null || ramp < 0) {
-      _showError(
-        'Rampa musi być liczbą całkowitą 0 lub większą.',
-      );
-      return;
-    }
-
-    setState(() {
-      _savingMotor = true;
-    });
-
-    try {
-      await widget.onSaveMotorSettings(
-        maxSpeed: maxSpeed,
-        ramp: ramp,
-      );
-
-      if (!mounted) return;
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Parametry silnika zapisane. Wysłano SET_MOTOR.',
-          ),
-        ),
-      );
-    } finally {
-      if (mounted) {
-        setState(() {
-          _savingMotor = false;
-        });
-      }
-    }
-  }
-
-  void _showError(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        backgroundColor: Colors.red.shade800,
-      ),
-    );
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Ustawienia'),
-        backgroundColor: const Color(0xFF181818),
+    return Container(
+      decoration: const BoxDecoration(
+        color: Color(0xFF1E1E1E),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
       ),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          _buildSectionTitle(
-            icon: Icons.straighten,
-            title: 'Dystanse',
-          ),
-
-          const SizedBox(height: 10),
-
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                children: [
-                  _buildDistanceField(
-                    controller: _d10,
-                    label: 'Preset 10 m',
-                  ),
-                  const SizedBox(height: 12),
-                  _buildDistanceField(
-                    controller: _d25,
-                    label: 'Preset 25 m',
-                  ),
-                  const SizedBox(height: 12),
-                  _buildDistanceField(
-                    controller: _d33,
-                    label: 'Preset 33 m',
-                  ),
-                  const SizedBox(height: 12),
-                  _buildDistanceField(
-                    controller: _d50,
-                    label: 'Preset 50 m',
-                  ),
-                  const SizedBox(height: 18),
-                  SizedBox(
-                    width: double.infinity,
-                    height: 52,
-                    child: FilledButton.icon(
-                      onPressed: _savingDistances
-                          ? null
-                          : _saveDistances,
-                      icon: _savingDistances
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child:
-                                  CircularProgressIndicator(
-                                strokeWidth: 2,
-                              ),
-                            )
-                          : const Icon(Icons.save),
-                      label: const Text(
-                        'ZAPISZ DYSTANSE',
-                      ),
-                    ),
-                  ),
-                ],
+      padding: EdgeInsets.only(
+        left: 16,
+        right: 16,
+        top: 16,
+        bottom: MediaQuery.of(context).viewInsets.bottom + 16,
+      ),
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(
+              child: Container(
+                width: 56,
+                height: 5,
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.35),
+                  borderRadius: BorderRadius.circular(10),
+                ),
               ),
             ),
-          ),
-
-          const SizedBox(height: 28),
-
-          _buildSectionTitle(
-            icon: Icons.speed,
-            title: 'Silnik',
-          ),
-
-          const SizedBox(height: 10),
-
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                children: [
-                  TextField(
-                    controller: _maxSpeed,
-                    keyboardType: TextInputType.number,
-                    decoration: const InputDecoration(
-                      labelText: 'Maksymalna prędkość PWM',
-                      helperText: 'Dozwolony zakres: 50–255',
-                      prefixIcon: Icon(Icons.speed),
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  TextField(
-                    controller: _ramp,
-                    keyboardType: TextInputType.number,
-                    decoration: const InputDecoration(
-                      labelText: 'Rampa przyspieszania/hamowania',
-                      helperText: 'W impulsach',
-                      prefixIcon: Icon(
-                        Icons.trending_up,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 18),
-                  SizedBox(
-                    width: double.infinity,
-                    height: 52,
-                    child: FilledButton.icon(
-                      onPressed:
-                          _savingMotor ? null : _saveMotor,
-                      icon: _savingMotor
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child:
-                                  CircularProgressIndicator(
-                                strokeWidth: 2,
-                              ),
-                            )
-                          : const Icon(Icons.save),
-                      label: const Text(
-                        'ZAPISZ PARAMETRY SILNIKA',
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-
-          const SizedBox(height: 28),
-
-          _buildSectionTitle(
-            icon: Icons.bluetooth,
-            title: 'Protokół Bluetooth',
-          ),
-
-          const SizedBox(height: 10),
-
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment:
-                    CrossAxisAlignment.start,
-                children: [
-                  _protocolRow(
-                    'Pozycja',
-                    'POS:18.4',
-                  ),
-                  _protocolRow(
-                    'Home',
-                    'STATUS:HOME_OK',
-                  ),
-                  _protocolRow(
-                    'Dojazd',
-                    'STATUS:ARRIVED:X',
-                  ),
-                  _protocolRow(
-                    'Konfiguracja',
-                    'CFG:OK',
-                  ),
-                  _protocolRow(
-                    'Jazda',
-                    'JEDZ:X',
-                  ),
-                  _protocolRow(
-                    'Home',
-                    'HOME',
-                  ),
-                  _protocolRow(
-                    'Dystanse',
-                    'SET_DIST:d10,d25,d33,d50',
-                  ),
-                  _protocolRow(
-                    'Silnik',
-                    'SET_MOTOR:maxSpd,rampa',
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildSectionTitle({
-    required IconData icon,
-    required String title,
-  }) {
-    return Row(
-      children: [
-        Icon(
-          icon,
-          color: Colors.blueAccent,
-        ),
-        const SizedBox(width: 9),
-        Text(
-          title,
-          style: const TextStyle(
-            fontSize: 20,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildDistanceField({
-    required TextEditingController controller,
-    required String label,
-  }) {
-    return TextField(
-      controller: controller,
-      keyboardType: const TextInputType.numberWithOptions(
-        decimal: true,
-      ),
-      decoration: InputDecoration(
-        labelText: label,
-        suffixText: 'm',
-        prefixIcon: const Icon(
-          Icons.route,
-        ),
-      ),
-    );
-  }
-
-  Widget _protocolRow(
-    String name,
-    String command,
-  ) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(
-        vertical: 7,
-      ),
-      child: Row(
-        crossAxisAlignment:
-            CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 105,
-            child: Text(
-              name,
+            const SizedBox(height: 18),
+            const Text(
+              'Ustawienia',
               style: TextStyle(
-                color: Colors.grey.shade500,
+                fontSize: 24,
+                fontWeight: FontWeight.w700,
+                color: Colors.white,
               ),
             ),
-          ),
-          Expanded(
-            child: Text(
-              command,
-              style: const TextStyle(
-                fontFamily: 'monospace',
-                color: Colors.greenAccent,
-                fontSize: 12,
+            const SizedBox(height: 20),
+            const Text(
+              'Dystansy',
+              style: TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.w600,
+                color: Colors.white,
               ),
             ),
-          ),
-        ],
+            const SizedBox(height: 12),
+            Row(
+              children: List.generate(4, (index) {
+                return Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: TextField(
+                      controller: _distanceControllers[index],
+                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                      decoration: InputDecoration(
+                        labelText: 'D${index + 1}',
+                        labelStyle: const TextStyle(color: Colors.white70),
+                        filled: true,
+                        fillColor: const Color(0xFF262626),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                  ),
+                );
+              }),
+            ),
+            const SizedBox(height: 20),
+            const Text(
+              'Silnik',
+              style: TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.w600,
+                color: Colors.white,
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _maxSpeedController,
+              keyboardType: TextInputType.number,
+              decoration: InputDecoration(
+                labelText: 'Maks. prędkość PWM (50-255)',
+                labelStyle: const TextStyle(color: Colors.white70),
+                filled: true,
+                fillColor: const Color(0xFF262626),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide.none,
+                ),
+              ),
+              style: const TextStyle(color: Colors.white),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _rampController,
+              keyboardType: TextInputType.number,
+              decoration: InputDecoration(
+                labelText: 'Rampa przysp./ham. (impulsy)',
+                labelStyle: const TextStyle(color: Colors.white70),
+                filled: true,
+                fillColor: const Color(0xFF262626),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide.none,
+                ),
+              ),
+              style: const TextStyle(color: Colors.white),
+            ),
+            const SizedBox(height: 20),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: () {
+                  final distances = List.generate(4, (index) {
+                    final parsed = double.tryParse(_distanceControllers[index].text);
+                    return parsed ?? 0.0;
+                  });
+
+                  final maxSpeed = int.tryParse(_maxSpeedController.text) ?? 200;
+                  final ramp = int.tryParse(_rampController.text) ?? 60;
+
+                  widget.onSave(distances, maxSpeed.clamp(50, 255), ramp);
+                  Navigator.pop(context);
+                },
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF3A6EA5),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+                child: const Text(
+                  'Zapisz ustawienia',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
