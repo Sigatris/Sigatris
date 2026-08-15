@@ -55,6 +55,25 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
+      - name: Patch legacy Bluetooth Serial plugin for modern Android Gradle Plugin
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          roots = [Path(os.environ['HOME']) / '.pub-cache' / 'hosted' / 'pub.dev']
+          matches = []
+          for root in roots:
+              matches.extend(root.glob('flutter_bluetooth_serial-*/android/build.gradle'))
+          if not matches:
+              raise SystemExit('Nie znaleziono flutter_bluetooth_serial w pub-cache')
+          p = sorted(matches)[-1]
+          s = p.read_text()
+          if 'namespace' not in s:
+              s = s.replace('android {', 'android {\n    namespace "io.github.edufolly.flutterbluetoothserial"', 1)
+              p.write_text(s)
+          print('Patched:', p)
+          PY
+
       - name: Build release APK
         run: flutter build apk --release
 
