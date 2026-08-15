@@ -1,935 +1,893 @@
-// =============================================================================
-// TARCZOCIĄG BT – Aplikacja Flutter do sterowania bezprzewodowym
-// tarczociągiem strzeleckim przez Bluetooth Classic (SPP / RFCOMM)
-// =============================================================================
-//
-// WYMAGANE ZALEŻNOŚCI (dodaj do pubspec.yaml):
-//
-//   dependencies:
-//     flutter:
-//       sdk: flutter
-//     flutter_bluetooth_serial: ^0.4.0
-//     shared_preferences: ^2.2.2
-//
-// WYMAGANE UPRAWNIENIA (android/app/src/main/AndroidManifest.xml),
-// wewnątrz <manifest ...> a przed <application ...>:
-//
-//   <uses-permission android:name="android.permission.BLUETOOTH" />
-//   <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
-//   <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-//   <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-//   <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
-//
-// Minimalny minSdkVersion: 21 (android/app/build.gradle).
-//
-// =============================================================================
-
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(const TarczociagApp());
+
+  final prefs = await SharedPreferences.getInstance();
+
+  runApp(
+    TargetPullerApp(
+      prefs: prefs,
+    ),
+  );
 }
 
-// =============================================================================
-// MOTYW / KOLORY
-// =============================================================================
+class TargetPullerApp extends StatelessWidget {
+  final SharedPreferences prefs;
 
-class AppColors {
-  static const background = Color(0xFF121212);
-  static const surface = Color(0xFF1C1C1E);
-  static const surfaceLight = Color(0xFF262629);
-  static const card = Color(0xFF1E1E1E);
-  static const accentBlue = Color(0xFF2196F3);
-  static const accentGreen = Color(0xFF43D17A);
-  static const accentOrange = Color(0xFFFF9800);
-  static const accentRed = Color(0xFFFF5252);
-  static const textPrimary = Color(0xFFF2F2F2);
-  static const textSecondary = Color(0xFF9A9A9E);
-  static const divider = Color(0xFF2E2E31);
-}
-
-class TarczociagApp extends StatelessWidget {
-  const TarczociagApp({super.key});
-
-  static final GlobalKey<ScaffoldMessengerState> messengerKey =
-      GlobalKey<ScaffoldMessengerState>();
+  const TargetPullerApp({
+    super.key,
+    required this.prefs,
+  });
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Tarczociąg BT',
       debugShowCheckedModeBanner: false,
-      scaffoldMessengerKey: messengerKey,
+      title: 'Tarczociąg',
       theme: ThemeData(
-        useMaterial3: true,
         brightness: Brightness.dark,
-        scaffoldBackgroundColor: AppColors.background,
-        colorScheme: const ColorScheme.dark(
-          primary: AppColors.accentBlue,
-          secondary: AppColors.accentGreen,
-          surface: AppColors.surface,
-          error: AppColors.accentRed,
+        scaffoldBackgroundColor: const Color(0xFF121212),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.blue,
+          brightness: Brightness.dark,
         ),
-        appBarTheme: const AppBarTheme(
-          backgroundColor: AppColors.surface,
-          elevation: 0,
-          centerTitle: false,
-          foregroundColor: AppColors.textPrimary,
-          iconTheme: IconThemeData(color: AppColors.textPrimary),
-        ),
-        cardTheme: CardThemeData(
-          color: AppColors.card,
-          elevation: 0,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(18),
-            side: const BorderSide(color: AppColors.divider),
-          ),
-        ),
-        textTheme: const TextTheme(
-          bodyLarge: TextStyle(color: AppColors.textPrimary),
-          bodyMedium: TextStyle(color: AppColors.textPrimary),
-          titleLarge: TextStyle(
-              color: AppColors.textPrimary, fontWeight: FontWeight.w600),
+        useMaterial3: true,
+        cardTheme: const CardThemeData(
+          color: Color(0xFF1E1E1E),
+          elevation: 3,
         ),
         inputDecorationTheme: InputDecorationTheme(
           filled: true,
-          fillColor: AppColors.surfaceLight,
+          fillColor: const Color(0xFF1B1B1B),
           border: OutlineInputBorder(
             borderRadius: BorderRadius.circular(12),
-            borderSide: BorderSide.none,
           ),
-          contentPadding:
-              const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-        ),
-        elevatedButtonTheme: ElevatedButtonThemeData(
-          style: ElevatedButton.styleFrom(
-            backgroundColor: AppColors.accentBlue,
-            foregroundColor: Colors.white,
-            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(12),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: const BorderSide(
+              color: Color(0xFF383838),
             ),
           ),
         ),
-        dividerColor: AppColors.divider,
       ),
-      home: const RootShell(),
+      home: TargetPullerHome(
+        prefs: prefs,
+      ),
     );
   }
 }
 
-// =============================================================================
-// WARSTWA BLUETOOTH
-// =============================================================================
+class TargetPullerHome extends StatefulWidget {
+  final SharedPreferences prefs;
 
-enum BtConnectionState { disconnected, connecting, connected }
-
-/// Zarządza połączeniem SPP/RFCOMM: łączenie, rozłączanie, wysyłanie ramek
-/// oraz bezpieczne parsowanie przychodzącego strumienia bajtów na linie
-/// tekstowe zakończone znakiem '\n'.
-class BluetoothManager extends ChangeNotifier {
-  BluetoothConnection? _connection;
-  BtConnectionState state = BtConnectionState.disconnected;
-  BluetoothDevice? currentDevice;
-
-  String _rxBuffer = '';
-  final StreamController<String> _lineController =
-      StreamController<String>.broadcast();
-
-  /// Strumień pojedynczych, kompletnych linii odebranych po Bluetooth.
-  Stream<String> get lines => _lineController.stream;
-
-  Future<List<BluetoothDevice>> getBondedDevices() async {
-    try {
-      return await FlutterBluetoothSerial.instance.getBondedDevices();
-    } catch (_) {
-      return <BluetoothDevice>[];
-    }
-  }
-
-  Future<bool> ensureBluetoothEnabled() async {
-    try {
-      bool? enabled = await FlutterBluetoothSerial.instance.isEnabled;
-      if (enabled != true) {
-        await FlutterBluetoothSerial.instance.requestEnable();
-        enabled = await FlutterBluetoothSerial.instance.isEnabled;
-      }
-      return enabled ?? false;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  Future<bool> connect(BluetoothDevice device) async {
-    if (state == BtConnectionState.connecting) return false;
-    state = BtConnectionState.connecting;
-    notifyListeners();
-
-    try {
-      final conn = await BluetoothConnection.toAddress(device.address);
-      _connection = conn;
-      currentDevice = device;
-      state = BtConnectionState.connected;
-      notifyListeners();
-
-      conn.input!.listen(
-        _onDataReceived,
-        onDone: _handleRemoteDisconnect,
-        onError: (_) => _handleRemoteDisconnect(),
-        cancelOnError: true,
-      );
-      return true;
-    } catch (_) {
-      _connection = null;
-      currentDevice = null;
-      state = BtConnectionState.disconnected;
-      notifyListeners();
-      return false;
-    }
-  }
-
-  void _onDataReceived(Uint8List data) {
-    _rxBuffer += utf8.decode(data, allowMalformed: true);
-    int idx;
-    while ((idx = _rxBuffer.indexOf('\n')) != -1) {
-      final rawLine = _rxBuffer.substring(0, idx);
-      _rxBuffer = _rxBuffer.substring(idx + 1);
-      final line = rawLine.replaceAll('\r', '').trim();
-      if (line.isNotEmpty) {
-        _lineController.add(line);
-      }
-    }
-  }
-
-  void _handleRemoteDisconnect() {
-    _connection = null;
-    currentDevice = null;
-    state = BtConnectionState.disconnected;
-    notifyListeners();
-  }
-
-  Future<void> disconnect() async {
-    try {
-      await _connection?.finish();
-    } catch (_) {}
-    try {
-      _connection?.close();
-    } catch (_) {}
-    _connection = null;
-    currentDevice = null;
-    state = BtConnectionState.disconnected;
-    notifyListeners();
-  }
-
-  /// Wysyła ramkę tekstową. Dopisuje '\n' jeśli go brakuje.
-  bool send(String frame) {
-    final conn = _connection;
-    if (conn == null || !conn.isConnected) return false;
-    try {
-      final payload = frame.endsWith('\n') ? frame : '$frame\n';
-      conn.output.add(Uint8List.fromList(utf8.encode(payload)));
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
+  const TargetPullerHome({
+    super.key,
+    required this.prefs,
+  });
 
   @override
-  void dispose() {
-    _lineController.close();
-    try {
-      _connection?.dispose();
-    } catch (_) {}
-    super.dispose();
-  }
+  State<TargetPullerHome> createState() => _TargetPullerHomeState();
 }
 
-// =============================================================================
-// FORMATOWANIE LICZB DO RAMEK
-// =============================================================================
-
-String fmtNum(double v) {
-  if (v == v.roundToDouble()) return v.toInt().toString();
-  return v.toStringAsFixed(1);
-}
-
-// =============================================================================
-// ROOT SHELL – trzyma stan aplikacji, PageView, BT, SharedPreferences
-// =============================================================================
-
-class RootShell extends StatefulWidget {
-  const RootShell({super.key});
-
-  @override
-  State<RootShell> createState() => _RootShellState();
-}
-
-class _RootShellState extends State<RootShell> {
-  final BluetoothManager _bt = BluetoothManager();
+class _TargetPullerHomeState extends State<TargetPullerHome> {
   final PageController _pageController = PageController();
 
-  int _currentPage = 0;
-  double? _position; // aktualna pozycja tarczy [m]
-  String _lastStatusLine = '';
+  BluetoothConnection? _connection;
+  StreamSubscription<Uint8List>? _inputSubscription;
 
-  Map<String, double> distances = {
-    'd10': 10,
-    'd25': 25,
-    'd33': 33,
-    'd50': 50,
-  };
+  bool _connecting = false;
+  bool _connected = false;
 
-  int maxSpeed = 200; // PWM 50-255
-  int ramp = 50; // impulsy rampy
+  String _connectionStatus = 'Rozłączono';
+  String _deviceName = '';
 
-  SharedPreferences? _prefs;
-  StreamSubscription<String>? _linesSub;
+  double? _position;
+  String _deviceStatus = 'Brak danych';
+
+  // Bufor odbieranych danych.
+  String _receiveBuffer = '';
+
+  // Presety dystansów.
+  late double _distance10;
+  late double _distance25;
+  late double _distance33;
+  late double _distance50;
+
+  // Parametry silnika.
+  late int _maxSpeed;
+  late int _ramp;
 
   @override
   void initState() {
     super.initState();
-    _loadPrefs();
-    _bt.addListener(_onBtChanged);
-    _linesSub = _bt.lines.listen(_handleIncomingLine);
+    _loadSettings();
   }
 
-  Future<void> _loadPrefs() async {
-    final p = await SharedPreferences.getInstance();
-    setState(() {
-      _prefs = p;
-      distances = {
-        'd10': p.getDouble('d10') ?? 10,
-        'd25': p.getDouble('d25') ?? 25,
-        'd33': p.getDouble('d33') ?? 33,
-        'd50': p.getDouble('d50') ?? 50,
-      };
-      maxSpeed = p.getInt('maxSpeed') ?? 200;
-      ramp = p.getInt('ramp') ?? 50;
-      _position = p.getDouble('lastPosition');
-    });
-  }
+  void _loadSettings() {
+    _distance10 = widget.prefs.getDouble('distance10') ?? 10.0;
+    _distance25 = widget.prefs.getDouble('distance25') ?? 25.0;
+    _distance33 = widget.prefs.getDouble('distance33') ?? 33.0;
+    _distance50 = widget.prefs.getDouble('distance50') ?? 50.0;
 
-  Future<void> _persistDistancesAndMotor() async {
-    final p = _prefs;
-    if (p == null) return;
-    await p.setDouble('d10', distances['d10']!);
-    await p.setDouble('d25', distances['d25']!);
-    await p.setDouble('d33', distances['d33']!);
-    await p.setDouble('d50', distances['d50']!);
-    await p.setInt('maxSpeed', maxSpeed);
-    await p.setInt('ramp', ramp);
-  }
-
-  void _onBtChanged() {
-    if (mounted) setState(() {});
-  }
-
-  void _handleIncomingLine(String line) {
-    if (line.startsWith('POS:')) {
-      final raw = line.substring(4).trim().replaceAll(',', '.');
-      final value = double.tryParse(raw);
-      if (value != null) {
-        setState(() => _position = value);
-        _prefs?.setDouble('lastPosition', value);
-      }
-    } else if (line.startsWith('STATUS:')) {
-      final status = line.substring(7);
-      setState(() => _lastStatusLine = status);
-      _notify(_describeStatus(status));
-    } else if (line.startsWith('CFG:')) {
-      setState(() => _lastStatusLine = line);
-      _notify('Konfiguracja potwierdzona: ${line.substring(4)}');
-    }
-  }
-
-  String _describeStatus(String status) {
-    if (status == 'HOME_OK') return 'Powrót do bazy zakończony';
-    if (status.startsWith('ARRIVED:')) {
-      return 'Dojazd do pozycji ${status.substring(8)} m';
-    }
-    return 'Status: $status';
-  }
-
-  void _notify(String message) {
-    TarczociagApp.messengerKey.currentState?.showSnackBar(
-      SnackBar(
-        content: Text(message),
-        backgroundColor: AppColors.surfaceLight,
-        duration: const Duration(seconds: 2),
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
-  }
-
-  Future<void> _openConnectSheet() async {
-    final enabled = await _bt.ensureBluetoothEnabled();
-    if (!enabled) {
-      _notify('Włącz Bluetooth w telefonie, aby kontynuować');
-      return;
-    }
-    if (!mounted) return;
-    await showModalBottomSheet(
-      context: context,
-      backgroundColor: AppColors.surface,
-      isScrollControlled: true,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (_) => DeviceListSheet(bt: _bt, onNotify: _notify),
-    );
-  }
-
-  Future<void> _openSettings() async {
-    final result = await Navigator.of(context).push<SettingsResult>(
-      MaterialPageRoute(
-        builder: (_) => SettingsScreen(
-          initialDistances: distances,
-          initialMaxSpeed: maxSpeed,
-          initialRamp: ramp,
-        ),
-      ),
-    );
-    if (result == null) return;
-
-    setState(() {
-      distances = result.distances;
-      maxSpeed = result.maxSpeed;
-      ramp = result.ramp;
-    });
-    await _persistDistancesAndMotor();
-
-    final distFrame = 'SET_DIST:'
-        '${fmtNum(distances['d10']!)},'
-        '${fmtNum(distances['d25']!)},'
-        '${fmtNum(distances['d33']!)},'
-        '${fmtNum(distances['d50']!)}';
-    final motorFrame = 'SET_MOTOR:$maxSpeed,$ramp';
-
-    final okDist = _bt.send(distFrame);
-    final okMotor = _bt.send(motorFrame);
-    if (okDist && okMotor) {
-      _notify('Ustawienia wysłane do urządzenia');
-    } else {
-      _notify('Ustawienia zapisane lokalnie (brak połączenia BT)');
-    }
-  }
-
-  void _sendPreset(String key) {
-    final value = distances[key]!;
-    final ok = _bt.send('JEDZ:${fmtNum(value)}');
-    if (!ok) _notify('Brak połączenia z tarczociągiem');
-  }
-
-  void _sendHome() {
-    final ok = _bt.send('HOME');
-    if (!ok) _notify('Brak połączenia z tarczociągiem');
+    _maxSpeed = widget.prefs.getInt('maxSpeed') ?? 200;
+    _ramp = widget.prefs.getInt('ramp') ?? 100;
   }
 
   @override
   void dispose() {
-    _linesSub?.cancel();
-    _bt.removeListener(_onBtChanged);
-    _bt.dispose();
     _pageController.dispose();
+    _disconnect();
     super.dispose();
+  }
+
+  // ---------------------------------------------------------------------------
+  // BLUETOOTH
+  // ---------------------------------------------------------------------------
+
+  Future<void> _showBluetoothDevices() async {
+    if (_connecting) return;
+
+    try {
+      final bluetoothState =
+          await FlutterBluetoothSerial.instance.state;
+
+      if (bluetoothState != BluetoothState.STATE_ON) {
+        if (!mounted) return;
+
+        await showDialog<void>(
+          context: context,
+          builder: (context) {
+            return AlertDialog(
+              title: const Text('Bluetooth wyłączony'),
+              content: const Text(
+                'Włącz Bluetooth w telefonie, a następnie spróbuj ponownie.',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('OK'),
+                ),
+              ],
+            );
+          },
+        );
+
+        return;
+      }
+
+      final devices =
+          await FlutterBluetoothSerial.instance.getBondedDevices();
+
+      if (!mounted) return;
+
+      await showModalBottomSheet<void>(
+        context: context,
+        backgroundColor: const Color(0xFF1A1A1A),
+        isScrollControlled: true,
+        builder: (context) {
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'Sparowane urządzenia',
+                    style: TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  if (devices.isEmpty)
+                    const Padding(
+                      padding: EdgeInsets.all(30),
+                      child: Text(
+                        'Brak sparowanych urządzeń Bluetooth.',
+                        textAlign: TextAlign.center,
+                      ),
+                    )
+                  else
+                    Flexible(
+                      child: ListView.separated(
+                        shrinkWrap: true,
+                        itemCount: devices.length,
+                        separatorBuilder: (_, __) =>
+                            const Divider(height: 1),
+                        itemBuilder: (context, index) {
+                          final device = devices[index];
+
+                          return ListTile(
+                            leading: const CircleAvatar(
+                              child: Icon(Icons.bluetooth),
+                            ),
+                            title: Text(
+                              device.name?.isNotEmpty == true
+                                  ? device.name!
+                                  : 'Nieznane urządzenie',
+                            ),
+                            subtitle: Text(device.address),
+                            trailing: const Icon(
+                              Icons.chevron_right,
+                            ),
+                            onTap: () {
+                              Navigator.pop(context);
+                              _connectToDevice(device);
+                            },
+                          );
+                        },
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          );
+        },
+      );
+    } catch (e) {
+      _showMessage('Błąd Bluetooth: $e');
+    }
+  }
+
+  Future<void> _connectToDevice(BluetoothDevice device) async {
+    if (_connecting) return;
+
+    await _disconnect();
+
+    if (!mounted) return;
+
+    setState(() {
+      _connecting = true;
+      _connectionStatus = 'Łączenie...';
+      _deviceName = device.name?.isNotEmpty == true
+          ? device.name!
+          : device.address;
+    });
+
+    try {
+      final connection =
+          await BluetoothConnection.toAddress(device.address);
+
+      if (!mounted) {
+        connection.dispose();
+        return;
+      }
+
+      _connection = connection;
+
+      setState(() {
+        _connecting = false;
+        _connected = true;
+        _connectionStatus = 'Połączono';
+      });
+
+      _startListening();
+
+      _showMessage(
+        'Połączono z ${_deviceName.isNotEmpty ? _deviceName : device.address}',
+      );
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        _connecting = false;
+        _connected = false;
+        _connectionStatus = 'Rozłączono';
+      });
+
+      _showMessage('Nie udało się połączyć: $e');
+    }
+  }
+
+  void _startListening() {
+    final input = _connection?.input;
+
+    if (input == null) {
+      return;
+    }
+
+    _inputSubscription?.cancel();
+
+    _inputSubscription = input.listen(
+      _onBluetoothData,
+      onError: (error) {
+        _handleConnectionLost('Błąd odbioru: $error');
+      },
+      onDone: () {
+        _handleConnectionLost('Połączenie zostało zamknięte.');
+      },
+      cancelOnError: false,
+    );
+  }
+
+  void _onBluetoothData(Uint8List data) {
+    try {
+      final text = utf8.decode(
+        data,
+        allowMalformed: true,
+      );
+
+      _receiveBuffer += text;
+
+      // ESP32 wysyła ramki zakończone \n.
+      while (_receiveBuffer.contains('\n')) {
+        final newlineIndex = _receiveBuffer.indexOf('\n');
+
+        String frame =
+            _receiveBuffer.substring(0, newlineIndex);
+
+        _receiveBuffer =
+            _receiveBuffer.substring(newlineIndex + 1);
+
+        frame = frame.trim();
+
+        if (frame.isEmpty) {
+          continue;
+        }
+
+        _processFrame(frame);
+      }
+
+      // Zabezpieczenie przed niekontrolowanym wzrostem bufora
+      // w przypadku uszkodzonych danych.
+      if (_receiveBuffer.length > 4096) {
+        _receiveBuffer =
+            _receiveBuffer.substring(_receiveBuffer.length - 1024);
+      }
+    } catch (e) {
+      debugPrint('Bluetooth parser error: $e');
+    }
+  }
+
+  void _processFrame(String frame) {
+    debugPrint('BT RX: $frame');
+
+    // POS:18.4
+    if (frame.startsWith('POS:')) {
+      final value = double.tryParse(
+        frame.substring(4).trim(),
+      );
+
+      if (value != null && mounted) {
+        setState(() {
+          _position = value;
+        });
+      }
+
+      return;
+    }
+
+    // STATUS:HOME_OK
+    if (frame == 'STATUS:HOME_OK') {
+      if (mounted) {
+        setState(() {
+          _deviceStatus = 'HOME OK';
+          _position = 0.0;
+        });
+      }
+
+      return;
+    }
+
+    // STATUS:ARRIVED:X
+    if (frame.startsWith('STATUS:ARRIVED:')) {
+      final value =
+          frame.substring('STATUS:ARRIVED:'.length);
+
+      if (mounted) {
+        setState(() {
+          _deviceStatus = 'Osiągnięto $value m';
+        });
+      }
+
+      return;
+    }
+
+    // CFG:OK
+    if (frame == 'CFG:OK') {
+      if (mounted) {
+        setState(() {
+          _deviceStatus = 'Konfiguracja OK';
+        });
+      }
+
+      _showMessage('Urządzenie potwierdziło konfigurację.');
+      return;
+    }
+
+    // Można łatwo rozszerzyć o kolejne ramki.
+    if (mounted) {
+      setState(() {
+        _deviceStatus = frame;
+      });
+    }
+  }
+
+  Future<void> _sendCommand(String command) async {
+    if (!_connected || _connection == null) {
+      _showMessage('Brak połączenia z tarczociągiem.');
+      return;
+    }
+
+    try {
+      final bytes = Uint8List.fromList(
+        utf8.encode(command),
+      );
+
+      _connection!.output.add(bytes);
+
+      await _connection!.output.allSent;
+
+      debugPrint('BT TX: ${command.trim()}');
+    } catch (e) {
+      _handleConnectionLost(
+        'Nie udało się wysłać polecenia: $e',
+      );
+    }
+  }
+
+  Future<void> _disconnect() async {
+    final subscription = _inputSubscription;
+    _inputSubscription = null;
+
+    await subscription?.cancel();
+
+    final connection = _connection;
+    _connection = null;
+
+    try {
+      await connection?.finish();
+    } catch (_) {
+      try {
+        connection?.dispose();
+      } catch (_) {}
+    }
+
+    if (mounted) {
+      setState(() {
+        _connected = false;
+        _connecting = false;
+        _connectionStatus = 'Rozłączono';
+      });
+    }
+  }
+
+  void _handleConnectionLost(String reason) {
+    _inputSubscription?.cancel();
+    _inputSubscription = null;
+
+    try {
+      _connection?.dispose();
+    } catch (_) {}
+
+    _connection = null;
+
+    if (mounted) {
+      setState(() {
+        _connected = false;
+        _connecting = false;
+        _connectionStatus = 'Rozłączono';
+        _deviceStatus = 'Brak połączenia';
+      });
+
+      _showMessage(reason);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // SETTINGS
+  // ---------------------------------------------------------------------------
+
+  Future<void> _saveDistances({
+    required double d10,
+    required double d25,
+    required double d33,
+    required double d50,
+  }) async {
+    await widget.prefs.setDouble('distance10', d10);
+    await widget.prefs.setDouble('distance25', d25);
+    await widget.prefs.setDouble('distance33', d33);
+    await widget.prefs.setDouble('distance50', d50);
+
+    if (mounted) {
+      setState(() {
+        _distance10 = d10;
+        _distance25 = d25;
+        _distance33 = d33;
+        _distance50 = d50;
+      });
+    }
+
+    await _sendCommand(
+      'SET_DIST:${_formatNumber(d10)},'
+      '${_formatNumber(d25)},'
+      '${_formatNumber(d33)},'
+      '${_formatNumber(d50)}\n',
+    );
+  }
+
+  Future<void> _saveMotorSettings({
+    required int maxSpeed,
+    required int ramp,
+  }) async {
+    await widget.prefs.setInt('maxSpeed', maxSpeed);
+    await widget.prefs.setInt('ramp', ramp);
+
+    if (mounted) {
+      setState(() {
+        _maxSpeed = maxSpeed;
+        _ramp = ramp;
+      });
+    }
+
+    await _sendCommand(
+      'SET_MOTOR:$maxSpeed,$ramp\n',
+    );
+  }
+
+  String _formatNumber(double value) {
+    if (value == value.roundToDouble()) {
+      return value.toInt().toString();
+    }
+
+    return value
+        .toStringAsFixed(1)
+        .replaceAll(RegExp(r'\.?0+$'), '');
+  }
+
+  Future<void> _openSettings() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => SettingsPage(
+          distance10: _distance10,
+          distance25: _distance25,
+          distance33: _distance33,
+          distance50: _distance50,
+          maxSpeed: _maxSpeed,
+          ramp: _ramp,
+          onSaveDistances: _saveDistances,
+          onSaveMotorSettings: _saveMotorSettings,
+        ),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // UI
+  // ---------------------------------------------------------------------------
+
+  void _showMessage(String message) {
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: Text(_currentPage == 0 ? 'Puszka wykonawcza' : 'Pulpit CYD'),
-        actions: [
-          if (_currentPage == 0) ...[
-            _ConnectionStatusChip(state: _bt.state, device: _bt.currentDevice),
-            const SizedBox(width: 8),
-            _ConnectButton(
-              state: _bt.state,
-              onConnect: _openConnectSheet,
-              onDisconnect: _bt.disconnect,
-            ),
-            IconButton(
-              icon: const Icon(Icons.settings_outlined),
-              tooltip: 'Ustawienia',
-              onPressed: _openSettings,
-            ),
+      body: SafeArea(
+        child: PageView(
+          controller: _pageController,
+          physics: const BouncingScrollPhysics(),
+          children: [
+            _buildMainPage(),
+            _buildCydPlaceholder(),
           ],
-        ],
+        ),
       ),
-      body: Column(
-        children: [
-          Expanded(
-            child: PageView(
-              controller: _pageController,
-              onPageChanged: (i) => setState(() => _currentPage = i),
+    );
+  }
+
+  Widget _buildMainPage() {
+    return Column(
+      children: [
+        _buildAppBar(),
+
+        Expanded(
+          child: SingleChildScrollView(
+            physics: const BouncingScrollPhysics(),
+            padding: const EdgeInsets.fromLTRB(
+              16,
+              8,
+              16,
+              16,
+            ),
+            child: Column(
               children: [
-                MainControlScreen(
-                  position: _position,
-                  distances: distances,
-                  lastStatus: _lastStatusLine,
-                  onPreset: _sendPreset,
-                  onHome: _sendHome,
-                ),
-                const CydPlaceholderScreen(),
+                _buildPositionCard(),
+
+                const SizedBox(height: 16),
+
+                _buildPresetGrid(),
+
+                const SizedBox(height: 18),
+
+                _buildHomeButton(),
+
+                const SizedBox(height: 10),
+
+                _buildDeviceStatus(),
               ],
             ),
           ),
-          Padding(
-            padding: const EdgeInsets.symmetric(vertical: 10),
+        ),
+
+        _buildPageIndicator(),
+      ],
+    );
+  }
+
+  Widget _buildAppBar() {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 12, 8, 12),
+      decoration: const BoxDecoration(
+        color: Color(0xFF181818),
+        border: Border(
+          bottom: BorderSide(
+            color: Color(0xFF2A2A2A),
+          ),
+        ),
+      ),
+      child: Row(
+        children: [
+          Expanded(
             child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: List.generate(2, (i) {
-                final active = i == _currentPage;
-                return AnimatedContainer(
-                  duration: const Duration(milliseconds: 200),
-                  margin: const EdgeInsets.symmetric(horizontal: 4),
-                  width: active ? 22 : 8,
-                  height: 8,
+              children: [
+                Container(
+                  width: 11,
+                  height: 11,
                   decoration: BoxDecoration(
-                    color: active
-                        ? AppColors.accentBlue
-                        : AppColors.surfaceLight,
-                    borderRadius: BorderRadius.circular(4),
+                    shape: BoxShape.circle,
+                    color: _connected
+                        ? Colors.greenAccent
+                        : Colors.redAccent,
+                    boxShadow: [
+                      BoxShadow(
+                        color: (_connected
+                                ? Colors.greenAccent
+                                : Colors.redAccent)
+                            .withValues(alpha: 0.4),
+                        blurRadius: 8,
+                      ),
+                    ],
                   ),
-                );
-              }),
+                ),
+                const SizedBox(width: 9),
+                Flexible(
+                  child: Column(
+                    crossAxisAlignment:
+                        CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        _connectionStatus,
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      if (_deviceName.isNotEmpty)
+                        Text(
+                          _deviceName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: Colors.grey.shade500,
+                            fontSize: 11,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ],
             ),
+          ),
+
+          if (_connecting)
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 12),
+              child: SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                ),
+              ),
+            )
+          else
+            FilledButton.icon(
+              onPressed: _connected
+                  ? _disconnect
+                  : _showBluetoothDevices,
+              icon: Icon(
+                _connected
+                    ? Icons.bluetooth_disabled
+                    : Icons.bluetooth,
+                size: 18,
+              ),
+              label: Text(
+                _connected ? 'Rozłącz' : 'Połącz',
+              ),
+              style: FilledButton.styleFrom(
+                backgroundColor: _connected
+                    ? Colors.red.shade800
+                    : Colors.blue.shade700,
+              ),
+            ),
+
+          const SizedBox(width: 4),
+
+          IconButton(
+            tooltip: 'Ustawienia',
+            onPressed: _openSettings,
+            icon: const Icon(Icons.settings),
           ),
         ],
       ),
     );
   }
-}
 
-// =============================================================================
-// WIDGETY STATUSU POŁĄCZENIA (AppBar)
-// =============================================================================
+  Widget _buildPositionCard() {
+    final positionText = _position == null
+        ? '--.-'
+        : _position!.toStringAsFixed(1);
 
-class _ConnectionStatusChip extends StatelessWidget {
-  final BtConnectionState state;
-  final BluetoothDevice? device;
-  const _ConnectionStatusChip({required this.state, required this.device});
-
-  @override
-  Widget build(BuildContext context) {
-    Color color;
-    String label;
-    switch (state) {
-      case BtConnectionState.connected:
-        color = AppColors.accentGreen;
-        label = 'Połączono';
-        break;
-      case BtConnectionState.connecting:
-        color = AppColors.accentOrange;
-        label = 'Łączenie…';
-        break;
-      case BtConnectionState.disconnected:
-        color = AppColors.accentRed;
-        label = 'Rozłączono';
-        break;
-    }
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Container(
-          width: 10,
-          height: 10,
-          decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(
+          vertical: 28,
+          horizontal: 16,
         ),
-        const SizedBox(width: 6),
-        Text(
-          label,
-          style: const TextStyle(fontSize: 12, color: AppColors.textSecondary),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(12),
+          gradient: const LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              Color(0xFF202020),
+              Color(0xFF181818),
+            ],
+          ),
+        ),
+        child: Column(
+          children: [
+            Text(
+              'AKTUALNA POZYCJA',
+              style: TextStyle(
+                color: Colors.grey.shade500,
+                letterSpacing: 1.8,
+                fontSize: 12,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 8),
+            FittedBox(
+              child: Text(
+                '$positionText m',
+                style: const TextStyle(
+                  fontSize: 58,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 2,
+                ),
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              _connected
+                  ? 'Dane z tarczociągu'
+                  : 'Oczekiwanie na połączenie',
+              style: TextStyle(
+                color: _connected
+                    ? Colors.greenAccent
+                    : Colors.grey.shade600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPresetGrid() {
+    return GridView.count(
+      crossAxisCount: 2,
+      crossAxisSpacing: 12,
+      mainAxisSpacing: 12,
+      childAspectRatio: 1.55,
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      children: [
+        _buildPresetTile(
+          label: '10 m',
+          value: _distance10,
+          color: Colors.blue,
+        ),
+        _buildPresetTile(
+          label: '25 m',
+          value: _distance25,
+          color: Colors.green,
+        ),
+        _buildPresetTile(
+          label: '33 m',
+          value: _distance33,
+          color: Colors.orange,
+        ),
+        _buildPresetTile(
+          label: '50 m',
+          value: _distance50,
+          color: Colors.deepPurple,
         ),
       ],
     );
   }
-}
 
-class _ConnectButton extends StatelessWidget {
-  final BtConnectionState state;
-  final VoidCallback onConnect;
-  final VoidCallback onDisconnect;
-  const _ConnectButton({
-    required this.state,
-    required this.onConnect,
-    required this.onDisconnect,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final connected = state == BtConnectionState.connected;
-    final connecting = state == BtConnectionState.connecting;
-    return Padding(
-      padding: const EdgeInsets.only(left: 8),
-      child: TextButton.icon(
-        onPressed: connecting ? null : (connected ? onDisconnect : onConnect),
-        icon: Icon(
-          connected ? Icons.bluetooth_connected : Icons.bluetooth,
-          size: 18,
-          color: connected ? AppColors.accentGreen : AppColors.accentBlue,
-        ),
-        label: Text(
-          connected ? 'Rozłącz' : 'Połącz',
-          style: TextStyle(
-            color: connected ? AppColors.accentGreen : AppColors.accentBlue,
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-// =============================================================================
-// DIALOG WYBORU URZĄDZENIA (sparowane urządzenia BT)
-// =============================================================================
-
-class DeviceListSheet extends StatefulWidget {
-  final BluetoothManager bt;
-  final void Function(String) onNotify;
-  const DeviceListSheet({super.key, required this.bt, required this.onNotify});
-
-  @override
-  State<DeviceListSheet> createState() => _DeviceListSheetState();
-}
-
-class _DeviceListSheetState extends State<DeviceListSheet> {
-  List<BluetoothDevice> _devices = [];
-  bool _loading = true;
-  String? _connectingAddress;
-
-  @override
-  void initState() {
-    super.initState();
-    _refresh();
-  }
-
-  Future<void> _refresh() async {
-    setState(() => _loading = true);
-    final devices = await widget.bt.getBondedDevices();
-    if (!mounted) return;
-    setState(() {
-      _devices = devices;
-      _loading = false;
-    });
-  }
-
-  Future<void> _connectTo(BluetoothDevice device) async {
-    setState(() => _connectingAddress = device.address);
-    final ok = await widget.bt.connect(device);
-    if (!mounted) return;
-    setState(() => _connectingAddress = null);
-    if (ok) {
-      widget.onNotify('Połączono z ${device.name ?? device.address}');
-      Navigator.of(context).pop();
-    } else {
-      widget.onNotify('Nie udało się połączyć z ${device.name ?? device.address}');
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                const Expanded(
-                  child: Text(
-                    'Sparowane urządzenia',
-                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
-                  ),
-                ),
-                IconButton(
-                  icon: const Icon(Icons.refresh, color: AppColors.textSecondary),
-                  onPressed: _loading ? null : _refresh,
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            if (_loading)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 30),
-                child: Center(child: CircularProgressIndicator()),
-              )
-            else if (_devices.isEmpty)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 30),
-                child: Text(
-                  'Brak sparowanych urządzeń. Sparuj tarczociąg w ustawieniach '
-                  'Bluetooth systemu Android, a następnie odśwież listę.',
-                  style: TextStyle(color: AppColors.textSecondary),
-                ),
-              )
-            else
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxHeight: 360),
-                child: ListView.separated(
-                  shrinkWrap: true,
-                  itemCount: _devices.length,
-                  separatorBuilder: (_, __) =>
-                      const Divider(height: 1, color: AppColors.divider),
-                  itemBuilder: (context, i) {
-                    final d = _devices[i];
-                    final isConnecting = _connectingAddress == d.address;
-                    return ListTile(
-                      leading: const Icon(Icons.bluetooth, color: AppColors.accentBlue),
-                      title: Text(d.name ?? 'Nieznane urządzenie'),
-                      subtitle: Text(
-                        d.address,
-                        style: const TextStyle(color: AppColors.textSecondary),
-                      ),
-                      trailing: isConnecting
-                          ? const SizedBox(
-                              width: 20,
-                              height: 20,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.chevron_right,
-                              color: AppColors.textSecondary),
-                      onTap: isConnecting ? null : () => _connectTo(d),
-                    );
-                  },
-                ),
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// =============================================================================
-// EKRAN 1 – PUSZKA WYKONAWCZA
-// =============================================================================
-
-class MainControlScreen extends StatelessWidget {
-  final double? position;
-  final Map<String, double> distances;
-  final String lastStatus;
-  final void Function(String presetKey) onPreset;
-  final VoidCallback onHome;
-
-  const MainControlScreen({
-    super.key,
-    required this.position,
-    required this.distances,
-    required this.lastStatus,
-    required this.onPreset,
-    required this.onHome,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return SafeArea(
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
-        child: Column(
-          children: [
-            _PositionDisplay(position: position, lastStatus: lastStatus),
-            const SizedBox(height: 24),
-            Text(
-              'PRESETY DYSTANSÓW',
-              style: TextStyle(
-                fontSize: 12,
-                letterSpacing: 1.2,
-                color: AppColors.textSecondary,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            const SizedBox(height: 10),
-            GridView.count(
-              crossAxisCount: 2,
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              mainAxisSpacing: 14,
-              crossAxisSpacing: 14,
-              childAspectRatio: 1.35,
-              children: [
-                PresetTile(
-                  label: '${fmtNum(distances['d10']!)} m',
-                  sublabel: 'Preset 1',
-                  color: AppColors.accentBlue,
-                  onTap: () => onPreset('d10'),
-                ),
-                PresetTile(
-                  label: '${fmtNum(distances['d25']!)} m',
-                  sublabel: 'Preset 2',
-                  color: AppColors.accentGreen,
-                  onTap: () => onPreset('d25'),
-                ),
-                PresetTile(
-                  label: '${fmtNum(distances['d33']!)} m',
-                  sublabel: 'Preset 3',
-                  color: AppColors.accentOrange,
-                  onTap: () => onPreset('d33'),
-                ),
-                PresetTile(
-                  label: '${fmtNum(distances['d50']!)} m',
-                  sublabel: 'Preset 4',
-                  color: AppColors.accentBlue,
-                  onTap: () => onPreset('d50'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 24),
-            SizedBox(
-              width: double.infinity,
-              height: 64,
-              child: ElevatedButton.icon(
-                onPressed: onHome,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: AppColors.accentRed,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16),
-                  ),
-                ),
-                icon: const Icon(Icons.home_filled, size: 26),
-                label: const Text(
-                  'POWRÓT (HOME)',
-                  style: TextStyle(
-                    fontSize: 17,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 0.5,
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _PositionDisplay extends StatelessWidget {
-  final double? position;
-  final String lastStatus;
-  const _PositionDisplay({required this.position, required this.lastStatus});
-
-  @override
-  Widget build(BuildContext context) {
-    final text = position != null ? '${position!.toStringAsFixed(1)}' : '--.-';
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(vertical: 30),
-      decoration: BoxDecoration(
-        color: AppColors.card,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: AppColors.divider),
-      ),
-      child: Column(
-        children: [
-          const Text(
-            'AKTUALNA POZYCJA',
-            style: TextStyle(
-              fontSize: 12,
-              letterSpacing: 1.2,
-              color: AppColors.textSecondary,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-          const SizedBox(height: 8),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            crossAxisAlignment: CrossAxisAlignment.baseline,
-            textBaseline: TextBaseline.alphabetic,
-            children: [
-              Text(
-                text,
-                style: const TextStyle(
-                  fontSize: 64,
-                  fontWeight: FontWeight.w700,
-                  color: AppColors.accentGreen,
-                  fontFeatures: [FontFeature.tabularFigures()],
-                ),
-              ),
-              const SizedBox(width: 8),
-              const Padding(
-                padding: EdgeInsets.only(bottom: 10),
-                child: Text(
-                  'm',
-                  style: TextStyle(
-                    fontSize: 22,
-                    color: AppColors.textSecondary,
-                    fontWeight: FontWeight.w500,
-                  ),
-                ),
-              ),
-            ],
-          ),
-          if (lastStatus.isNotEmpty) ...[
-            const SizedBox(height: 6),
-            Text(
-              lastStatus,
-              style: const TextStyle(fontSize: 12, color: AppColors.textSecondary),
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-}
-
-class PresetTile extends StatelessWidget {
-  final String label;
-  final String sublabel;
-  final Color color;
-  final VoidCallback onTap;
-
-  const PresetTile({
-    super.key,
-    required this.label,
-    required this.sublabel,
-    required this.color,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
+  Widget _buildPresetTile({
+    required String label,
+    required double value,
+    required MaterialColor color,
+  }) {
     return Material(
-      color: AppColors.card,
-      borderRadius: BorderRadius.circular(18),
+      color: color.shade900.withValues(alpha: 0.55),
+      borderRadius: BorderRadius.circular(16),
       child: InkWell(
-        borderRadius: BorderRadius.circular(18),
-        onTap: onTap,
+        borderRadius: BorderRadius.circular(16),
+        onTap: () {
+          _sendCommand(
+            'JEDZ:${_formatNumber(value)}\n',
+          );
+
+          if (mounted) {
+            setState(() {
+              _deviceStatus =
+                  'Jazda do ${_formatNumber(value)} m';
+            });
+          }
+        },
         child: Container(
+          padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(18),
-            border: Border.all(color: color.withOpacity(0.4)),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: color.shade700.withValues(alpha: 0.6),
+            ),
           ),
-          padding: const EdgeInsets.all(14),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(Icons.my_location, color: color, size: 26),
-              const SizedBox(height: 10),
+              Icon(
+                Icons.straighten,
+                color: color.shade200,
+                size: 25,
+              ),
+              const SizedBox(height: 7),
               Text(
                 label,
                 style: const TextStyle(
-                  fontSize: 24,
-                  fontWeight: FontWeight.w700,
-                  color: AppColors.textPrimary,
+                  fontSize: 23,
+                  fontWeight: FontWeight.bold,
                 ),
               ),
-              const SizedBox(height: 4),
               Text(
-                sublabel,
-                style: const TextStyle(
+                'JEDŹ',
+                style: TextStyle(
+                  color: color.shade200,
                   fontSize: 11,
-                  color: AppColors.textSecondary,
+                  letterSpacing: 1.2,
+                  fontWeight: FontWeight.bold,
                 ),
               ),
             ],
@@ -938,73 +896,125 @@ class PresetTile extends StatelessWidget {
       ),
     );
   }
-}
 
-// =============================================================================
-// EKRAN 2 – PLACEHOLDER PULPITU CYD
-// =============================================================================
+  Widget _buildHomeButton() {
+    return SizedBox(
+      width: double.infinity,
+      height: 76,
+      child: FilledButton.icon(
+        onPressed: () {
+          _sendCommand('HOME\n');
 
-class CydPlaceholderScreen extends StatelessWidget {
-  const CydPlaceholderScreen({super.key});
+          if (mounted) {
+            setState(() {
+              _deviceStatus = 'Powrót do HOME...';
+            });
+          }
+        },
+        icon: const Icon(
+          Icons.home,
+          size: 31,
+        ),
+        label: const Text(
+          'POWRÓT  •  HOME',
+          style: TextStyle(
+            fontSize: 20,
+            fontWeight: FontWeight.bold,
+            letterSpacing: 0.8,
+          ),
+        ),
+        style: FilledButton.styleFrom(
+          backgroundColor: Colors.red.shade800,
+          foregroundColor: Colors.white,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+          ),
+        ),
+      ),
+    );
+  }
 
-  @override
-  Widget build(BuildContext context) {
-    return SafeArea(
-      child: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(28),
-          child: Container(
-            padding: const EdgeInsets.all(28),
-            decoration: BoxDecoration(
-              color: AppColors.card,
-              borderRadius: BorderRadius.circular(20),
-              border: Border.all(color: AppColors.divider),
+  Widget _buildDeviceStatus() {
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(
+          horizontal: 14,
+          vertical: 11,
+        ),
+        child: Row(
+          children: [
+            Icon(
+              Icons.info_outline,
+              color: Colors.grey.shade500,
+              size: 20,
             ),
+            const SizedBox(width: 9),
+            Expanded(
+              child: Text(
+                _deviceStatus,
+                style: TextStyle(
+                  color: Colors.grey.shade400,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCydPlaceholder() {
+    return Padding(
+      padding: const EdgeInsets.all(20),
+      child: Center(
+        child: Card(
+          child: Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(30),
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Container(
-                  width: 72,
-                  height: 72,
-                  decoration: BoxDecoration(
-                    color: AppColors.surfaceLight,
-                    shape: BoxShape.circle,
-                  ),
-                  child: const Icon(
-                    Icons.dashboard_customize_outlined,
-                    color: AppColors.accentOrange,
-                    size: 34,
-                  ),
+                Icon(
+                  Icons.touch_app,
+                  size: 64,
+                  color: Colors.blue.shade300,
                 ),
                 const SizedBox(height: 20),
                 const Text(
                   'Moduł Pulpitu CYD',
-                  style: TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.w700,
-                    color: AppColors.textPrimary,
-                  ),
                   textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 25,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
-                const SizedBox(height: 10),
-                const Text(
+                const SizedBox(height: 12),
+                Text(
                   'Oczekiwanie na połączenie/konfigurację',
-                  style: TextStyle(
-                    fontSize: 14,
-                    color: AppColors.textSecondary,
-                  ),
                   textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: Colors.grey.shade500,
+                    fontSize: 15,
+                  ),
                 ),
-                const SizedBox(height: 18),
+                const SizedBox(height: 22),
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 9,
+                  ),
                   decoration: BoxDecoration(
-                    color: AppColors.surfaceLight,
-                    borderRadius: BorderRadius.circular(20),
+                    color: const Color(0xFF151515),
+                    borderRadius: BorderRadius.circular(10),
                   ),
                   child: const Text(
-                    'Rozbudowa: drugi moduł ESP32 + ekran dotykowy',
-                    style: TextStyle(fontSize: 11, color: AppColors.textSecondary),
+                    'CYD • ESP32 • PRZYSZŁY MODUŁ',
+                    style: TextStyle(
+                      color: Colors.blueAccent,
+                      fontSize: 11,
+                      letterSpacing: 1,
+                    ),
                   ),
                 ),
               ],
@@ -1014,58 +1024,112 @@ class CydPlaceholderScreen extends StatelessWidget {
       ),
     );
   }
+
+  Widget _buildPageIndicator() {
+    return Container(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          _indicator(true),
+          const SizedBox(width: 7),
+          _indicator(false),
+        ],
+      ),
+    );
+  }
+
+  Widget _indicator(bool active) {
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 200),
+      width: active ? 24 : 7,
+      height: 7,
+      decoration: BoxDecoration(
+        color: active
+            ? Colors.blueAccent
+            : Colors.grey.shade700,
+        borderRadius: BorderRadius.circular(10),
+      ),
+    );
+  }
 }
 
-// =============================================================================
-// EKRAN USTAWIEŃ
-// =============================================================================
+// ============================================================================
+// SETTINGS PAGE
+// ============================================================================
 
-class SettingsResult {
-  final Map<String, double> distances;
+class SettingsPage extends StatefulWidget {
+  final double distance10;
+  final double distance25;
+  final double distance33;
+  final double distance50;
+
   final int maxSpeed;
   final int ramp;
-  SettingsResult({
-    required this.distances,
+
+  final Future<void> Function({
+    required double d10,
+    required double d25,
+    required double d33,
+    required double d50,
+  }) onSaveDistances;
+
+  final Future<void> Function({
+    required int maxSpeed,
+    required int ramp,
+  }) onSaveMotorSettings;
+
+  const SettingsPage({
+    super.key,
+    required this.distance10,
+    required this.distance25,
+    required this.distance33,
+    required this.distance50,
     required this.maxSpeed,
     required this.ramp,
-  });
-}
-
-class SettingsScreen extends StatefulWidget {
-  final Map<String, double> initialDistances;
-  final int initialMaxSpeed;
-  final int initialRamp;
-
-  const SettingsScreen({
-    super.key,
-    required this.initialDistances,
-    required this.initialMaxSpeed,
-    required this.initialRamp,
+    required this.onSaveDistances,
+    required this.onSaveMotorSettings,
   });
 
   @override
-  State<SettingsScreen> createState() => _SettingsScreenState();
+  State<SettingsPage> createState() => _SettingsPageState();
 }
 
-class _SettingsScreenState extends State<SettingsScreen> {
+class _SettingsPageState extends State<SettingsPage> {
   late final TextEditingController _d10;
   late final TextEditingController _d25;
   late final TextEditingController _d33;
   late final TextEditingController _d50;
+
   late final TextEditingController _maxSpeed;
   late final TextEditingController _ramp;
 
-  final _formKey = GlobalKey<FormState>();
+  bool _savingDistances = false;
+  bool _savingMotor = false;
 
   @override
   void initState() {
     super.initState();
-    _d10 = TextEditingController(text: fmtNum(widget.initialDistances['d10']!));
-    _d25 = TextEditingController(text: fmtNum(widget.initialDistances['d25']!));
-    _d33 = TextEditingController(text: fmtNum(widget.initialDistances['d33']!));
-    _d50 = TextEditingController(text: fmtNum(widget.initialDistances['d50']!));
-    _maxSpeed = TextEditingController(text: widget.initialMaxSpeed.toString());
-    _ramp = TextEditingController(text: widget.initialRamp.toString());
+
+    _d10 = TextEditingController(
+      text: _formatNumber(widget.distance10),
+    );
+    _d25 = TextEditingController(
+      text: _formatNumber(widget.distance25),
+    );
+    _d33 = TextEditingController(
+      text: _formatNumber(widget.distance33),
+    );
+    _d50 = TextEditingController(
+      text: _formatNumber(widget.distance50),
+    );
+
+    _maxSpeed = TextEditingController(
+      text: widget.maxSpeed.toString(),
+    );
+    _ramp = TextEditingController(
+      text: widget.ramp.toString(),
+    );
   }
 
   @override
@@ -1079,175 +1143,399 @@ class _SettingsScreenState extends State<SettingsScreen> {
     super.dispose();
   }
 
-  String? _validateDistance(String? value) {
-    final v = double.tryParse((value ?? '').replaceAll(',', '.'));
-    if (v == null || v <= 0) return 'Podaj wartość > 0';
-    return null;
+  String _formatNumber(double value) {
+    if (value == value.roundToDouble()) {
+      return value.toInt().toString();
+    }
+
+    return value.toString();
   }
 
-  String? _validateSpeed(String? value) {
-    final v = int.tryParse(value ?? '');
-    if (v == null) return 'Podaj liczbę';
-    if (v < 50 || v > 255) return 'Zakres 50–255';
-    return null;
-  }
-
-  String? _validateRamp(String? value) {
-    final v = int.tryParse(value ?? '');
-    if (v == null || v < 0) return 'Podaj liczbę ≥ 0';
-    return null;
-  }
-
-  void _save() {
-    if (!_formKey.currentState!.validate()) return;
-
-    final result = SettingsResult(
-      distances: {
-        'd10': double.parse(_d10.text.replaceAll(',', '.')),
-        'd25': double.parse(_d25.text.replaceAll(',', '.')),
-        'd33': double.parse(_d33.text.replaceAll(',', '.')),
-        'd50': double.parse(_d50.text.replaceAll(',', '.')),
-      },
-      maxSpeed: int.parse(_maxSpeed.text),
-      ramp: int.parse(_ramp.text),
+  double? _parseDistance(
+    TextEditingController controller,
+  ) {
+    return double.tryParse(
+      controller.text.trim().replaceAll(',', '.'),
     );
-    Navigator.of(context).pop(result);
+  }
+
+  int? _parseInt(
+    TextEditingController controller,
+  ) {
+    return int.tryParse(
+      controller.text.trim(),
+    );
+  }
+
+  Future<void> _saveDistances() async {
+    final d10 = _parseDistance(_d10);
+    final d25 = _parseDistance(_d25);
+    final d33 = _parseDistance(_d33);
+    final d50 = _parseDistance(_d50);
+
+    if (d10 == null ||
+        d25 == null ||
+        d33 == null ||
+        d50 == null ||
+        d10 <= 0 ||
+        d25 <= 0 ||
+        d33 <= 0 ||
+        d50 <= 0) {
+      _showError(
+        'Wszystkie dystanse muszą być poprawnymi liczbami większymi od 0.',
+      );
+      return;
+    }
+
+    setState(() {
+      _savingDistances = true;
+    });
+
+    try {
+      await widget.onSaveDistances(
+        d10: d10,
+        d25: d25,
+        d33: d33,
+        d50: d50,
+      );
+
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Dystanse zapisane. Wysłano SET_DIST.',
+          ),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _savingDistances = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _saveMotor() async {
+    final maxSpeed = _parseInt(_maxSpeed);
+    final ramp = _parseInt(_ramp);
+
+    if (maxSpeed == null ||
+        maxSpeed < 50 ||
+        maxSpeed > 255) {
+      _showError(
+        'Maksymalna prędkość PWM musi być w zakresie 50–255.',
+      );
+      return;
+    }
+
+    if (ramp == null || ramp < 0) {
+      _showError(
+        'Rampa musi być liczbą całkowitą 0 lub większą.',
+      );
+      return;
+    }
+
+    setState(() {
+      _savingMotor = true;
+    });
+
+    try {
+      await widget.onSaveMotorSettings(
+        maxSpeed: maxSpeed,
+        ramp: ramp,
+      );
+
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Parametry silnika zapisane. Wysłano SET_MOTOR.',
+          ),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _savingMotor = false;
+        });
+      }
+    }
+  }
+
+  void _showError(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: Colors.red.shade800,
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Ustawienia')),
-      body: Form(
-        key: _formKey,
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(20, 16, 20, 40),
-          children: [
-            _SectionHeader(title: 'DYSTANSE PRESETÓW', icon: Icons.straighten),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: _NumberField(
-                    label: 'Preset 1 (m)',
+      appBar: AppBar(
+        title: const Text('Ustawienia'),
+        backgroundColor: const Color(0xFF181818),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          _buildSectionTitle(
+            icon: Icons.straighten,
+            title: 'Dystanse',
+          ),
+
+          const SizedBox(height: 10),
+
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                children: [
+                  _buildDistanceField(
                     controller: _d10,
-                    validator: _validateDistance,
+                    label: 'Preset 10 m',
                   ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _NumberField(
-                    label: 'Preset 2 (m)',
+                  const SizedBox(height: 12),
+                  _buildDistanceField(
                     controller: _d25,
-                    validator: _validateDistance,
+                    label: 'Preset 25 m',
                   ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: _NumberField(
-                    label: 'Preset 3 (m)',
+                  const SizedBox(height: 12),
+                  _buildDistanceField(
                     controller: _d33,
-                    validator: _validateDistance,
+                    label: 'Preset 33 m',
                   ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _NumberField(
-                    label: 'Preset 4 (m)',
+                  const SizedBox(height: 12),
+                  _buildDistanceField(
                     controller: _d50,
-                    validator: _validateDistance,
+                    label: 'Preset 50 m',
                   ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 28),
-            _SectionHeader(title: 'SILNIK', icon: Icons.settings_input_component),
-            const SizedBox(height: 12),
-            _NumberField(
-              label: 'Maks. prędkość PWM (50–255)',
-              controller: _maxSpeed,
-              validator: _validateSpeed,
-            ),
-            const SizedBox(height: 12),
-            _NumberField(
-              label: 'Rampa przyspieszania/hamowania (impulsy)',
-              controller: _ramp,
-              validator: _validateRamp,
-            ),
-            const SizedBox(height: 32),
-            SizedBox(
-              width: double.infinity,
-              height: 54,
-              child: ElevatedButton.icon(
-                onPressed: _save,
-                icon: const Icon(Icons.save_outlined),
-                label: const Text(
-                  'ZAPISZ I WYŚLIJ',
-                  style: TextStyle(fontWeight: FontWeight.w700),
-                ),
+                  const SizedBox(height: 18),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 52,
+                    child: FilledButton.icon(
+                      onPressed: _savingDistances
+                          ? null
+                          : _saveDistances,
+                      icon: _savingDistances
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child:
+                                  CircularProgressIndicator(
+                                strokeWidth: 2,
+                              ),
+                            )
+                          : const Icon(Icons.save),
+                      label: const Text(
+                        'ZAPISZ DYSTANSE',
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
-            const SizedBox(height: 10),
-            const Text(
-              'Ustawienia są zapisywane lokalnie na telefonie oraz wysyłane do '
-              'urządzenia (SET_DIST / SET_MOTOR), jeśli jest ono połączone.',
-              style: TextStyle(fontSize: 12, color: AppColors.textSecondary),
+          ),
+
+          const SizedBox(height: 28),
+
+          _buildSectionTitle(
+            icon: Icons.speed,
+            title: 'Silnik',
+          ),
+
+          const SizedBox(height: 10),
+
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                children: [
+                  TextField(
+                    controller: _maxSpeed,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(
+                      labelText: 'Maksymalna prędkość PWM',
+                      helperText: 'Dozwolony zakres: 50–255',
+                      prefixIcon: Icon(Icons.speed),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  TextField(
+                    controller: _ramp,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(
+                      labelText: 'Rampa przyspieszania/hamowania',
+                      helperText: 'W impulsach',
+                      prefixIcon: Icon(
+                        Icons.trending_up,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 52,
+                    child: FilledButton.icon(
+                      onPressed:
+                          _savingMotor ? null : _saveMotor,
+                      icon: _savingMotor
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child:
+                                  CircularProgressIndicator(
+                                strokeWidth: 2,
+                              ),
+                            )
+                          : const Icon(Icons.save),
+                      label: const Text(
+                        'ZAPISZ PARAMETRY SILNIKA',
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
-          ],
-        ),
+          ),
+
+          const SizedBox(height: 28),
+
+          _buildSectionTitle(
+            icon: Icons.bluetooth,
+            title: 'Protokół Bluetooth',
+          ),
+
+          const SizedBox(height: 10),
+
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment:
+                    CrossAxisAlignment.start,
+                children: [
+                  _protocolRow(
+                    'Pozycja',
+                    'POS:18.4',
+                  ),
+                  _protocolRow(
+                    'Home',
+                    'STATUS:HOME_OK',
+                  ),
+                  _protocolRow(
+                    'Dojazd',
+                    'STATUS:ARRIVED:X',
+                  ),
+                  _protocolRow(
+                    'Konfiguracja',
+                    'CFG:OK',
+                  ),
+                  _protocolRow(
+                    'Jazda',
+                    'JEDZ:X',
+                  ),
+                  _protocolRow(
+                    'Home',
+                    'HOME',
+                  ),
+                  _protocolRow(
+                    'Dystanse',
+                    'SET_DIST:d10,d25,d33,d50',
+                  ),
+                  _protocolRow(
+                    'Silnik',
+                    'SET_MOTOR:maxSpd,rampa',
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
-}
 
-class _SectionHeader extends StatelessWidget {
-  final String title;
-  final IconData icon;
-  const _SectionHeader({required this.title, required this.icon});
-
-  @override
-  Widget build(BuildContext context) {
+  Widget _buildSectionTitle({
+    required IconData icon,
+    required String title,
+  }) {
     return Row(
       children: [
-        Icon(icon, size: 18, color: AppColors.accentBlue),
-        const SizedBox(width: 8),
+        Icon(
+          icon,
+          color: Colors.blueAccent,
+        ),
+        const SizedBox(width: 9),
         Text(
           title,
           style: const TextStyle(
-            fontSize: 12,
-            letterSpacing: 1.2,
-            fontWeight: FontWeight.w700,
-            color: AppColors.textSecondary,
+            fontSize: 20,
+            fontWeight: FontWeight.bold,
           ),
         ),
       ],
     );
   }
-}
 
-class _NumberField extends StatelessWidget {
-  final String label;
-  final TextEditingController controller;
-  final String? Function(String?) validator;
-
-  const _NumberField({
-    required this.label,
-    required this.controller,
-    required this.validator,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return TextFormField(
+  Widget _buildDistanceField({
+    required TextEditingController controller,
+    required String label,
+  }) {
+    return TextField(
       controller: controller,
-      keyboardType: const TextInputType.numberWithOptions(decimal: true),
-      style: const TextStyle(color: AppColors.textPrimary),
-      decoration: InputDecoration(labelText: label),
-      validator: validator,
+      keyboardType: const TextInputType.numberWithOptions(
+        decimal: true,
+      ),
+      decoration: InputDecoration(
+        labelText: label,
+        suffixText: 'm',
+        prefixIcon: const Icon(
+          Icons.route,
+        ),
+      ),
+    );
+  }
+
+  Widget _protocolRow(
+    String name,
+    String command,
+  ) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(
+        vertical: 7,
+      ),
+      child: Row(
+        crossAxisAlignment:
+            CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 105,
+            child: Text(
+              name,
+              style: TextStyle(
+                color: Colors.grey.shade500,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              command,
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                color: Colors.greenAccent,
+                fontSize: 12,
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
