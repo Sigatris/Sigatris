@@ -33,12 +33,14 @@ jobs:
       - name: Generate Android project
         run: flutter create --platforms=android --org pl.sigatris.tarczociag .
 
-      - name: Add Android Bluetooth permissions
+      - name: Configure Android Bluetooth Classic
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('android/app/src/main/AndroidManifest.xml')
-          s = p.read_text()
+          import re
+
+          manifest = Path('android/app/src/main/AndroidManifest.xml')
+          s = manifest.read_text()
           marker = '<manifest xmlns:android="http://schemas.android.com/apk/res/android">'
           perms = '''
               <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
@@ -47,9 +49,61 @@ jobs:
               <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
               <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
           '''
-          if marker in s and 'BLUETOOTH_CONNECT' not in s:
+          if 'android.permission.BLUETOOTH_CONNECT' not in s:
               s = s.replace(marker, marker + perms)
-          p.write_text(s)
+          manifest.write_text(s)
+
+          # flutter create generates MainActivity under the actual Java package.
+          # Request Nearby Devices permission before flutter_bluetooth_serial
+          # calls getBondedDevices()/opens an RFCOMM connection.
+          candidates = list(Path('android/app/src/main/kotlin').rglob('MainActivity.kt'))
+          if not candidates:
+              raise SystemExit('Nie znaleziono MainActivity.kt')
+          main_activity = candidates[0]
+          package_match = re.search(r'^package\\s+([\\w.]+)', main_activity.read_text(), re.M)
+          if not package_match:
+              raise SystemExit('Nie znaleziono deklaracji package w MainActivity.kt')
+          package_name = package_match.group(1)
+          main_activity.write_text(f'''package {package_name}
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import androidx.core.app.ActivityCompat
+import io.flutter.embedding.android.FlutterActivity
+
+class MainActivity : FlutterActivity() {{
+    companion object {{
+        private const val BT_PERMISSION_REQUEST = 7001
+    }}
+
+    override fun onCreate(savedInstanceState: Bundle?) {{
+        super.onCreate(savedInstanceState)
+        requestBluetoothPermissions()
+    }}
+
+    private fun requestBluetoothPermissions() {{
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {{
+            val permissions = arrayOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT
+            )
+            val missing = permissions.filter {{
+                ActivityCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+            }}
+            if (missing.isNotEmpty()) {{
+                ActivityCompat.requestPermissions(this, missing.toTypedArray(), BT_PERMISSION_REQUEST)
+            }}
+        }} else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {{
+            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {{
+                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), BT_PERMISSION_REQUEST)
+            }}
+        }}
+    }}
+}}
+''')
+          print('Bluetooth permissions configured:', main_activity)
           PY
 
       - name: Get dependencies
@@ -70,14 +124,53 @@ jobs:
           s = p.read_text()
           if 'namespace' not in s:
               s = s.replace('android {', 'android {\n    namespace "io.github.edufolly.flutterbluetoothserial"', 1)
-          # The legacy plugin declares SDK 30 but its resources use newer
-          # Android attributes (including android:attr/lStar). Compile the
-          # plugin against a modern SDK without changing the app minSdk.
           s = s.replace('compileSdkVersion 30', 'compileSdkVersion 34')
           s = s.replace('compileSdkVersion = 30', 'compileSdkVersion = 34')
           s = s.replace('compileSdk 30', 'compileSdk 34')
           p.write_text(s)
           print('Patched:', p)
+          PY
+
+      - name: Patch Flutter Bluetooth app
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path('lib/main.dart')
+          d = p.read_text()
+
+          # Uint8List is used by flutter_bluetooth_serial for RX/TX.
+          if "import 'dart:typed_data';" not in d:
+              d = d.replace("import 'dart:convert';", "import 'dart:convert';\nimport 'dart:typed_data';", 1)
+
+          # Do not silently hide Android Bluetooth permission errors.
+          old = """    } catch (_) {\n      if (mounted) {\n        setState(() {\n          _isConnected = false;\n          _statusMessage = 'Nie udało się połączyć';\n        });\n      }\n    } finally {"""
+          new = """    } catch (e) {\n      if (mounted) {\n        setState(() {\n          _isConnected = false;\n          _statusMessage = 'Błąd BT: $e';\n        });\n        ScaffoldMessenger.of(context).showSnackBar(\n          SnackBar(content: Text('Bluetooth: $e')),\n        );\n      }\n    } finally {"""
+          if old in d:
+              d = d.replace(old, new, 1)
+
+          # Replace the device picker with automatic selection of the already
+          # paired Tarczociag_Puszka device. If it is not found, show a clear
+          # message instead of opening an empty in-app list.
+          start = d.find('  void _showDevicePicker() async {')
+          end_marker = '\n  void _showSettingsSheet()'
+          if start != -1:
+              end = d.find(end_marker, start)
+              if end != -1:
+                  replacement = '''  Future<void> _showDevicePicker() async {\n    await _refreshBondedDevices();\n    if (!mounted) return;\n\n    BluetoothDevice? target;\n    for (final device in _pairedDevices) {\n      if ((device.name ?? '').trim() == 'Tarczociag_Puszka') {\n        target = device;\n        break;\n      }\n    }\n\n    if (target == null) {\n      setState(() {\n        _statusMessage = 'Nie znaleziono Tarczociag_Puszka';\n      });\n      ScaffoldMessenger.of(context).showSnackBar(\n        const SnackBar(\n          content: Text('Sparuj Tarczociag_Puszka w ustawieniach Bluetooth Androida, a następnie kliknij Połącz.'),\n        ),\n      );\n      return;\n    }\n\n    await _connectToDevice(target);\n  }\n'''
+                  d = d[:start] + replacement + d[end:]
+
+          # ESP32 puszka reports STEPS:<integer>. Keep the current position
+          # parser intact and expose the received value in the status field.
+          if "frame.startsWith('STEPS:')" not in d:
+              marker = "    if (frame == 'STATUS:HOME_OK') {"
+              extra = '''    if (frame.startsWith('STEPS:')) {\n      final raw = frame.substring(6).trim();\n      final steps = int.tryParse(raw);\n      if (steps != null && mounted) {\n        setState(() {\n          _statusMessage = 'STEPS: $steps';\n        });\n      }\n      return;\n    }\n\n'''
+              if marker in d:
+                  d = d.replace(marker, extra + marker, 1)
+
+          p.write_text(d)
+          print('Patched Flutter Bluetooth UI:', p)
           PY
 
       - name: Build release APK
