@@ -32,17 +32,54 @@ jobs:
       - name: Generate Android project
         run: flutter create --platforms=android --org pl.sigatris.tarczociag .
 
-      - name: Add Android Bluetooth permissions
+      - name: Configure Android Bluetooth Classic
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          p=Path('android/app/src/main/AndroidManifest.xml')
-          s=p.read_text()
-          marker='<manifest xmlns:android="http://schemas.android.com/apk/res/android">'
-          perms='''\n    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />\n    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />\n    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />\n    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />\n    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />\n'''
-          if marker in s and 'BLUETOOTH_CONNECT' not in s:
-              s=s.replace(marker,marker+perms)
-          p.write_text(s)
+          import re
+
+          manifest = Path('android/app/src/main/AndroidManifest.xml')
+          s = manifest.read_text()
+          marker = '<manifest xmlns:android="http://schemas.android.com/apk/res/android">'
+          perms = '''\n    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />\n    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />\n    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />\n    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />\n    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />\n'''
+          if 'android.permission.BLUETOOTH_CONNECT' not in s:
+              s = s.replace(marker, marker + perms)
+          manifest.write_text(s)
+
+          # Flutter creates MainActivity.kt. Request Android 12+ Nearby devices
+          # permission before flutter_bluetooth_serial calls getBondedDevices().
+          main = Path('android/app/src/main/kotlin/pl/sigatris/tarczociag/MainActivity.kt')
+          main.parent.mkdir(parents=True, exist_ok=True)
+          main.write_text('''package pl.sigatris.tarczociag\n\nimport android.Manifest\nimport android.content.pm.PackageManager\nimport android.os.Build\nimport android.os.Bundle\nimport androidx.core.app.ActivityCompat\nimport io.flutter.embedding.android.FlutterActivity\n\nclass MainActivity : FlutterActivity() {\n    companion object {\n        private const val BT_PERMISSION_REQUEST = 7001\n    }\n\n    override fun onCreate(savedInstanceState: Bundle?) {\n        super.onCreate(savedInstanceState)\n        requestBluetoothPermissions()\n    }\n\n    private fun requestBluetoothPermissions() {\n        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {\n            val permissions = arrayOf(\n                Manifest.permission.BLUETOOTH_SCAN,\n                Manifest.permission.BLUETOOTH_CONNECT\n            )\n            val missing = permissions.filter {\n                ActivityCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED\n            }\n            if (missing.isNotEmpty()) {\n                ActivityCompat.requestPermissions(this, missing.toTypedArray(), BT_PERMISSION_REQUEST)\n            }\n        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {\n            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {\n                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), BT_PERMISSION_REQUEST)\n            }\n        }\n    }\n}\n''')
+
+          # The old UI opened an in-app device picker. Make the Połącz button
+          # automatically use the already paired Tarczociag_Puszka device.
+          dart = Path('lib/main.dart')
+          d = dart.read_text()
+          if "import 'dart:typed_data';" not in d:
+              d = d.replace("import 'dart:convert';", "import 'dart:convert';\nimport 'dart:typed_data';")
+
+          start = d.find('  void _showDevicePicker() async {')
+          if start != -1:
+              marker = "\n  void _showSettingsSheet()"
+              end = d.find(marker, start)
+              if end != -1:
+                  replacement = '''  Future<void> _showDevicePicker() async {\n    await _refreshBondedDevices();\n    if (!mounted) return;\n\n    BluetoothDevice? target;\n    for (final device in _pairedDevices) {\n      final name = (device.name ?? '').trim();\n      if (name == 'Tarczociag_Puszka') {\n        target = device;\n        break;\n      }\n    }\n\n    target ??= _pairedDevices.isNotEmpty ? _pairedDevices.first : null;\n\n    if (target == null) {\n      setState(() {\n        _statusMessage = 'Nie znaleziono sparowanego Tarczociag_Puszka';\n      });\n      ScaffoldMessenger.of(context).showSnackBar(\n        const SnackBar(content: Text('Sparuj Tarczociag_Puszka w ustawieniach Bluetooth Androida.')),\n      );\n      return;\n    }\n\n    await _connectToDevice(target);\n  }\n'''
+                  d = d[:start] + replacement + d[end:]
+
+          # ESP32 puszka reports STEPS:<integer>, not POS:<double>.
+          needle = "    if (frame.startsWith('POS:')) {"
+          if needle in d and "frame.startsWith('STEPS:')" not in d:
+              block_end = d.find("\n    if (frame == 'STATUS:HOME_OK')", d.find(needle))
+              if block_end != -1:
+                  block = d[d.find(needle):block_end]
+                  extra = '''\n    if (frame.startsWith('STEPS:')) {\n      final raw = frame.substring(6).trim();\n      final steps = double.tryParse(raw);\n      if (steps != null && mounted) {\n        // Puszka raportuje kroki silnika. Zachowujemy ostatnią wartość\n        // jako diagnostykę; właściwa kalibracja krok->metr pozostaje po stronie ESP32.\n        setState(() {\n          _statusMessage = 'STEPS: ${steps.toInt()}';\n        });\n      }\n      return;\n    }\n'''
+                  d = d[:block_end] + extra + d[block_end:]
+
+          # Show the real Bluetooth exception instead of hiding it.
+          d = d.replace("    } catch (_) {\n      if (mounted) {\n        setState(() {\n          _isConnected = false;\n          _statusMessage = 'Nie udało się połączyć';\n        });\n      }\n    } finally {", "    } catch (e) {\n      if (mounted) {\n        setState(() {\n          _isConnected = false;\n          _statusMessage = 'Błąd BT: $e';\n        });\n        ScaffoldMessenger.of(context).showSnackBar(\n          SnackBar(content: Text('Bluetooth: $e')),\n        );\n      }\n    } finally {")
+
+          dart.write_text(d)
           PY
 
       - name: Get dependencies
