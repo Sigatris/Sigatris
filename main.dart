@@ -32,6 +32,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -163,7 +164,8 @@ class BluetoothManager extends ChangeNotifier {
         enabled = await FlutterBluetoothSerial.instance.isEnabled;
       }
       return enabled ?? false;
-    } catch (_) {
+    } catch (e) {
+      debugPrint('BT enable error: $e');
       return false;
     }
   }
@@ -333,20 +335,28 @@ class _RootShellState extends State<RootShell> {
   }
 
   void _handleIncomingLine(String line) {
-    if (line.startsWith('POS:')) {
-      final raw = line.substring(4).trim().replaceAll(',', '.');
-      final value = double.tryParse(raw);
-      if (value != null) {
-        setState(() => _position = value);
-        _prefs?.setDouble('lastPosition', value);
+    if (line.startsWith('STEPS:')) {
+      final raw = line.substring(6).trim();
+      final steps = int.tryParse(raw);
+      if (steps != null) {
+        // ESP wysyła surowe kroki enkodera, nie metry — na razie pokazujemy
+        // wartość wprost, dopóki nie dodamy przelicznika kroki→metry.
+        setState(() => _position = steps.toDouble());
+        _prefs?.setDouble('lastPosition', steps.toDouble());
       }
+    } else if (line == 'STATUS') {
+      // np. po stopMotor() lub w trakcie bazowania — brak dwukropka
+      setState(() => _lastStatusLine = 'Zatrzymano');
     } else if (line.startsWith('STATUS:')) {
       final status = line.substring(7);
       setState(() => _lastStatusLine = status);
       _notify(_describeStatus(status));
-    } else if (line.startsWith('CFG:')) {
+    } else if (line.startsWith('CONFIG:')) {
       setState(() => _lastStatusLine = line);
-      _notify('Konfiguracja potwierdzona: ${line.substring(4)}');
+      _notify('Konfiguracja potwierdzona: ${line.substring(7)}');
+    } else if (line == 'ERROR') {
+      setState(() => _lastStatusLine = 'BŁĄD: silnik zablokowany');
+      _notify('Błąd: wykryto zablokowanie silnika (stall)');
     }
   }
 
@@ -369,7 +379,24 @@ class _RootShellState extends State<RootShell> {
     );
   }
 
+  Future<bool> _requestBtPermissions() async {
+    final statuses = await [
+      Permission.bluetoothConnect,
+      Permission.bluetoothScan,
+      Permission.locationWhenInUse,
+    ].request();
+
+    final granted = statuses.values.every((s) => s.isGranted);
+    if (!granted) {
+      _notify('Brak uprawnień Bluetooth — zezwól w ustawieniach aplikacji');
+    }
+    return granted;
+  }
+
   Future<void> _openConnectSheet() async {
+    final hasPermissions = await _requestBtPermissions();
+    if (!hasPermissions) return;
+
     final enabled = await _bt.ensureBluetoothEnabled();
     if (!enabled) {
       _notify('Włącz Bluetooth w telefonie, aby kontynuować');

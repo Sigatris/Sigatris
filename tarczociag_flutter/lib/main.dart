@@ -3,6 +3,7 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
@@ -161,6 +162,24 @@ class _TarczociagAppState extends State<TarczociagApp>
     await prefs.setInt('motor_ramp', _accelRamp);
   }
 
+  Future<bool> _requestBtPermissions() async {
+    final statuses = await [
+      Permission.bluetoothConnect,
+      Permission.bluetoothScan,
+      Permission.locationWhenInUse,
+    ].request();
+
+    final granted = statuses.values.every((s) => s.isGranted);
+    if (!granted && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Brak uprawnień Bluetooth — zezwól w ustawieniach aplikacji'),
+        ),
+      );
+    }
+    return granted;
+  }
+
   Future<void> _refreshBondedDevices() async {
     try {
       final devices = await FlutterBluetoothSerial.instance.getBondedDevices();
@@ -269,10 +288,13 @@ class _TarczociagAppState extends State<TarczociagApp>
   void _processFrame(String frame) {
     if (frame.isEmpty) return;
 
-    if (frame.startsWith('POS:')) {
-      final raw = frame.substring(4).trim();
-      final parsed = double.tryParse(raw);
-      if (parsed != null) {
+    if (frame.startsWith('STEPS:')) {
+      final raw = frame.substring(6).trim();
+      final steps = int.tryParse(raw);
+      if (steps != null) {
+        // ESP wysyła surowe kroki enkodera, nie metry — na razie pokazujemy
+        // wartość wprost, dopóki nie dodamy przelicznika kroki→metry.
+        final parsed = steps.toDouble();
         setState(() {
           _positionValue = parsed;
           _positionText = '${parsed.toStringAsFixed(1)} m';
@@ -280,6 +302,14 @@ class _TarczociagAppState extends State<TarczociagApp>
 
         _evaluateTargetStatus(parsed);
       }
+      return;
+    }
+
+    if (frame == 'STATUS') {
+      // np. po stopMotor() lub w trakcie bazowania — brak dwukropka
+      setState(() {
+        _statusMessage = 'Zatrzymano';
+      });
       return;
     }
 
@@ -312,9 +342,16 @@ class _TarczociagAppState extends State<TarczociagApp>
       return;
     }
 
-    if (frame == 'CFG:OK') {
+    if (frame.startsWith('CONFIG:')) {
       setState(() {
-        _statusMessage = 'Konfiguracja zapisana';
+        _statusMessage = 'Konfiguracja potwierdzona: ${frame.substring(7)}';
+      });
+      return;
+    }
+
+    if (frame == 'ERROR') {
+      setState(() {
+        _statusMessage = 'Błąd: wykryto zablokowanie silnika (stall)';
       });
       return;
     }
@@ -391,6 +428,9 @@ class _TarczociagAppState extends State<TarczociagApp>
   }
 
   void _showDevicePicker() async {
+    final hasPermissions = await _requestBtPermissions();
+    if (!hasPermissions) return;
+
     await _refreshBondedDevices();
 
     if (!mounted) return;
